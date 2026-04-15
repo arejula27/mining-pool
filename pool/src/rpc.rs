@@ -73,7 +73,10 @@ impl RpcClient {
     pub async fn get_block_template(&self) -> Result<BlockTemplate> {
         let params = json!([{ "rules": ["segwit"] }]);
         let result = self.call("getblocktemplate", params).await?;
-        serde_json::from_value(result).context("Failed to parse BlockTemplate")
+        let tmpl: BlockTemplate =
+            serde_json::from_value(result).context("Failed to parse BlockTemplate")?;
+        tmpl.assert_invariants();
+        Ok(tmpl)
     }
 
     /// Blocks until Bitcoin Core has a new template to offer (new block or
@@ -81,7 +84,10 @@ impl RpcClient {
     async fn get_block_template_longpoll(&self, longpollid: &str) -> Result<BlockTemplate> {
         let params = json!([{ "rules": ["segwit"], "longpollid": longpollid }]);
         let result = self.call_longpoll("getblocktemplate", params).await?;
-        serde_json::from_value(result).context("Failed to parse BlockTemplate (longpoll)")
+        let tmpl: BlockTemplate =
+            serde_json::from_value(result).context("Failed to parse BlockTemplate (longpoll)")?;
+        tmpl.assert_invariants();
+        Ok(tmpl)
     }
 
     /// Returns null on success, or an error string if the block was rejected.
@@ -117,6 +123,25 @@ impl RpcClient {
             .as_str()
             .map(|s| s.to_string())
             .context("getnewaddress did not return a string")
+    }
+
+    /// Send `amount_btc` to `address` and return the txid.  Regtest only.
+    pub async fn send_to_address(&self, address: &str, amount_btc: f64) -> Result<String> {
+        let result = self.call("sendtoaddress", json!([address, amount_btc])).await?;
+        result
+            .as_str()
+            .map(|s| s.to_string())
+            .context("sendtoaddress did not return a txid")
+    }
+
+    /// Return the current `blocks` count from `getblockchaininfo`.
+    pub async fn get_block_count(&self) -> Result<u32> {
+        let result = self.call("getblockchaininfo", json!([])).await?;
+        result
+            .get("blocks")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as u32)
+            .context("getblockchaininfo missing 'blocks' field")
     }
 }
 
@@ -192,6 +217,21 @@ pub struct BlockTemplate {
     pub longpollid: String,
 }
 
+impl BlockTemplate {
+    fn assert_invariants(&self) {
+        debug_assert_eq!(self.previousblockhash.len(), 64, "prevhash must be 64 hex chars");
+        debug_assert_eq!(self.target.len(), 64, "target must be 64 hex chars");
+        debug_assert!(!self.bits.is_empty(), "bits must not be empty");
+        debug_assert!(!self.longpollid.is_empty(), "longpollid must not be empty");
+        debug_assert!(self.coinbasevalue > 0, "coinbasevalue must be positive");
+        debug_assert!(self.curtime > 0, "curtime must be positive");
+        debug_assert!(self.version > 0, "version must be positive");
+        for tx in &self.transactions {
+            tx.assert_invariants();
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct TemplateTransaction {
     /// Raw serialized transaction in hex.
@@ -201,4 +241,14 @@ pub struct TemplateTransaction {
     pub hash: String,
     pub fee: i64,
     pub weight: u32,
+}
+
+impl TemplateTransaction {
+    fn assert_invariants(&self) {
+        debug_assert_eq!(self.txid.len(), 64, "txid must be 64 hex chars");
+        debug_assert_eq!(self.hash.len(), 64, "hash must be 64 hex chars");
+        debug_assert!(!self.data.is_empty(), "tx data must not be empty");
+        debug_assert!(self.fee >= 0, "fee must be non-negative");
+        debug_assert!(self.weight > 0, "weight must be positive");
+    }
 }

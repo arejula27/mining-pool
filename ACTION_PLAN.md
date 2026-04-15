@@ -11,16 +11,16 @@ y los miners envían shares de vuelta. Comportamiento idéntico a public-pool.
 
 ## Paso 2 — Cliente RPC de Bitcoin Core
 - [x] Conectar al nodo via JSON-RPC (usuario/contraseña desde config)
-- [ ] Implementar llamada a `getblocktemplate`
-- [ ] Parsear la respuesta: transacciones, prevhash, bits, height, coinbasevalue
-- [ ] Poll de nuevos bloques (detectar cuando llega bloque nuevo → `clearJobs`)
+- [x] Implementar llamada a `getblocktemplate`
+- [x] Parsear la respuesta: transacciones, prevhash, bits, height, coinbasevalue
+- [x] Poll de nuevos bloques (detectar cuando llega bloque nuevo → `clearJobs`)
 
 ## Paso 3 — Constructor de jobs
-- [ ] Construir la transacción coinbase con la dirección del miner
-- [ ] Calcular el witness commitment (SegWit)
-- [ ] Construir el merkle tree a partir de las transacciones
-- [ ] Generar `extranonce1` único por conexión y `extranonce2` de tamaño fijo
-- [ ] Serializar el job en formato `mining.notify`
+- [x] Construir la transacción coinbase con la dirección del miner
+- [x] Calcular el witness commitment (SegWit)
+- [x] Construir el merkle tree a partir de las transacciones
+- [x] Generar `extranonce1` único por conexión y `extranonce2` de tamaño fijo
+- [x] Serializar el job en formato `mining.notify`
 
 ## Paso 4 — Servidor Stratum V1 (TCP + JSON-RPC)
 - [ ] TCP listener en el puerto configurado

@@ -9,6 +9,7 @@ start:
     bitcoind -datadir={{data_dir}} -daemon
     @echo "Waiting for RPC..."
     @until {{cli}} getblockchaininfo > /dev/null 2>&1; do sleep 0.5; done
+    @{{cli}} createwallet default > /dev/null 2>&1 || {{cli}} loadwallet default > /dev/null 2>&1 || true
     @echo "bitcoind ready"
 
 # Stop bitcoind gracefully via RPC
@@ -35,6 +36,10 @@ clean:
 check:
     cargo check --manifest-path pool/Cargo.toml --tests
 
+# Run unit tests (no bitcoind required)
+unit:
+    cargo test --manifest-path pool/Cargo.toml --lib -- --test-threads=1
+
 # Mine N blocks to a throwaway address (for regtest testing)
 mine n="1":
     {{cli}} generatetoaddress {{n}} $({{cli}} getnewaddress)
@@ -43,7 +48,7 @@ mine n="1":
 test-integration:
     #!/usr/bin/env bash
     just start || exit 1
-    cargo test --manifest-path pool/Cargo.toml --tests -- --nocapture
+    cargo test --manifest-path pool/Cargo.toml --tests -- --nocapture --test-threads=1
     EXIT=$?
     just stop
     exit $EXIT
@@ -53,7 +58,7 @@ alias int := test-integration
 test-integration-rpc:
     #!/usr/bin/env bash
     just start || exit 1
-    cargo test --manifest-path pool/Cargo.toml --test rpc -- --nocapture
+    cargo test --manifest-path pool/Cargo.toml --test rpc -- --nocapture --test-threads=1
     EXIT=$?
     just stop
     exit $EXIT

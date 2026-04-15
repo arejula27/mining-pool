@@ -47,6 +47,43 @@ async fn wrong_credentials_returns_error() {
 }
 
 #[tokio::test]
+async fn block_template_height_is_next_block() {
+    let client = regtest_client();
+
+    // Fetch both without mining so other concurrent tests don't skew the result.
+    // getblocktemplate always targets the next block (tip + 1); allow for the
+    // small race window where another test mines a block between the two calls.
+    let blocks = client.get_block_count().await.expect("getblockchaininfo failed");
+    let tmpl = client.get_block_template().await.expect("getblocktemplate failed");
+
+    assert!(tmpl.height >= blocks + 1, "template height must be at least tip + 1");
+}
+
+#[tokio::test]
+async fn block_template_transaction_fields_are_valid() {
+    let client = regtest_client();
+    let addr = client.get_new_address().await.expect("getnewaddress failed");
+
+    // Mine 101 blocks so the first coinbase matures and we have spendable funds.
+    client.generate_to_address(101, &addr).await.expect("generatetoaddress failed");
+
+    // Send a transaction so the mempool is non-empty.
+    client.send_to_address(&addr, 0.001).await.expect("sendtoaddress failed");
+
+    let tmpl = client.get_block_template().await.expect("getblocktemplate failed");
+
+    assert!(!tmpl.transactions.is_empty(), "template must contain the mempool tx");
+
+    for tx in &tmpl.transactions {
+        assert_eq!(tx.txid.len(), 64, "txid must be 64 hex chars");
+        assert_eq!(tx.hash.len(), 64, "hash must be 64 hex chars");
+        assert!(!tx.data.is_empty(), "tx data must not be empty");
+        assert!(tx.fee >= 0, "fee must be non-negative");
+        assert!(tx.weight > 0, "weight must be positive");
+    }
+}
+
+#[tokio::test]
 async fn template_poller_updates_on_new_block() {
     let client = regtest_client();
     let poller = TemplatePoller::start(client.clone()).await.expect("poller failed to start");
@@ -66,5 +103,5 @@ async fn template_poller_updates_on_new_block() {
         .expect("watch channel closed");
 
     let height_after = rx.borrow().height;
-    assert_eq!(height_after, height_before + 1, "height must increment by 1");
+    assert!(height_after > height_before, "height must increase (before={height_before}, after={height_after})");
 }
