@@ -1,0 +1,5 @@
+# Bitcoin Core runtime data (blockchain, wallet, indexes)
+.bitcoin-data/
+
+# Rust build artifacts
+target/
