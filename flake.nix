@@ -24,6 +24,47 @@
 					name = rustVersion;
 					sha256 = "sha256-SJwZ8g0zF2WrKDVmHrVG3pD2RGoQeo24MEXnNx5FyuI=";
 				};
+
+				# SV2 Template Provider — pre-built binary from GitHub releases.
+				# Connects to bitcoin-node via IPC and serves the Template Distribution
+				# Protocol to our pool on port 8442.
+				# Only available for x86_64-linux (the primary dev platform).
+				sv2-tp = pkgs.stdenv.mkDerivation {
+					pname = "sv2-tp";
+					version = "1.0.3";
+
+					src = pkgs.fetchurl {
+						url = "https://github.com/stratum-mining/sv2-tp/releases/download/v1.0.3/sv2-tp-1.0.3-x86_64-linux-gnu.tar.gz";
+						hash = "sha256-NkLVTev2DnN88oKzRuXlU5wuEgkz/U2GTFWmkOeJzXg=";
+					};
+
+					# Patch the ELF interpreter and RPATH so the binary runs inside the
+					# Nix sandbox without relying on /lib64/ld-linux-x86-64.so.2.
+					nativeBuildInputs = [ pkgs.autoPatchelfHook ];
+					# libgcc_s.so.1 comes from stdenv.cc.cc.lib; glibc is provided by stdenv.
+					buildInputs = [ pkgs.stdenv.cc.cc.lib ];
+
+					# The tarball extracts files at its root (no top-level directory),
+					# so unpack manually into a subdirectory and point sourceRoot at it
+					# so nix cds into it before running subsequent phases.
+					unpackPhase = ''
+						runHook preUnpack
+						mkdir unpacked
+						tar -xzf "$src" -C unpacked
+						sourceRoot="unpacked/sv2-tp-1.0.3"
+						runHook postUnpack
+					'';
+
+					installPhase = ''
+						runHook preInstall
+						mkdir -p "$out/bin"
+						cp bin/sv2-tp "$out/bin/sv2-tp"
+						runHook postInstall
+					'';
+
+					meta.platforms = [ "x86_64-linux" ];
+				};
+
 			in
 			{
 				devShells.default = pkgs.mkShell {
@@ -31,8 +72,11 @@
 						# Rust
 						rustToolchain.toolchain
 
-						# Bitcoin Core
+						# Bitcoin Core (v30.2) — includes both bitcoind and bitcoin-node
 						pkgs.bitcoind
+
+						# SV2 Template Provider
+						sv2-tp
 
 						# Task runner
 						pkgs.just
@@ -48,6 +92,10 @@
 							bitcoin-cli -datadir="$PWD/.bitcoin-data" "$@"
 						}
 						export -f bcli
+
+						# bitcoin-node (IPC-enabled multiprocess node) lives in libexec.
+						# Needed by sv2-tp to serve the Template Distribution Protocol.
+						export PATH="${pkgs.bitcoind}/libexec:$PATH"
 					'';
 				};
 			}
