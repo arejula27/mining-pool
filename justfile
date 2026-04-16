@@ -32,6 +32,16 @@ node-check:
 clean:
     cargo clean --manifest-path pool/Cargo.toml
 
+# Generate a fresh SV2 authority keypair — append output to .env
+keygen:
+    cargo run --manifest-path pool/Cargo.toml --bin keygen --quiet
+
+# Run the pool (sources .env if it exists)
+run:
+    #!/usr/bin/env bash
+    [ -f .env ] && set -a && source .env && set +a
+    cargo run --manifest-path pool/Cargo.toml --bin pool
+
 # Compile-check the Rust code
 check:
     cargo check --manifest-path pool/Cargo.toml --tests

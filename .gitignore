@@ -3,3 +3,6 @@
 
 # Rust build artifacts
 target/
+
+# Local environment (private keys — never commit)
+.env

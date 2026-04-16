@@ -31,7 +31,27 @@ cargo test --manifest-path pool/Cargo.toml --test rpc <test_name> -- --nocapture
 just stop
 ```
 
-## Architecture
+## Target architecture
+
+```
+Bitaxe/NerdAxe (SV1)
+       │  SV1
+       ▼
+  translator             ← sv2-apps binary, unmodified
+       │  SV2 Mining Protocol + Noise
+       ▼
+  our pool               ← what we write
+       │  SV2 Template Distribution Protocol
+       ▼
+  bitcoin-core-sv2       ← sv2-apps binary, unmodified
+       │
+       ▼
+  Bitcoin Core (regtest / mainnet)
+```
+
+SV1 miners connect through the official `translator` binary from sv2-apps. We only implement the SV2 pool side. We do NOT implement a direct SV1 server.
+
+## Codebase structure
 
 Single Rust crate (`pool/`) with both a library target (`src/lib.rs`) and a binary target (`src/main.rs`). The library exposes all logic; the binary is a thin entry point. Integration tests live in `pool/tests/`.
 
@@ -39,12 +59,12 @@ Bitcoin node config is in `bitcoin/bitcoin.conf` (tracked in git, regtest). Bloc
 
 ### Modules (current)
 
-- **`rpc`** — `RpcClient` (JSON-RPC over HTTP via `reqwest`/`rustls`) and `TemplatePoller`. The poller uses Bitcoin Core's long-polling (`longpollid`) to detect new blocks and broadcasts updated `BlockTemplate`s over a `tokio::sync::watch` channel. Consumers call `TemplatePoller::subscribe()` to get a receiver.
+- **`rpc`** — `RpcClient` (JSON-RPC over HTTP via `reqwest`/`rustls`) and `TemplatePoller`. The poller uses Bitcoin Core's long-polling (`longpollid`) to detect new blocks and broadcasts updated `BlockTemplate`s over a `tokio::sync::watch` channel. **Temporary**: will be replaced by the SV2 Template Distribution Protocol client (Paso 4b).
 
 - **`config`** — reads `RPC_URL`, `RPC_USER`, `RPC_PASS`, `STRATUM_PORT`, `POOL_ADDRESS` from environment variables.
 
-- **`jobs`** — Stratum V1 job construction. `build_stratum_job` builds a `StratumJob` from a `BlockTemplate` and a miner address. Internally builds `CoinbaseParts` (coinb1/coinb2 split around extranonce placeholder) and `build_merkle_branch` (sibling hashes in internal byte order). `pool/tests/fixtures/block_250000.json` is a real-block fixture used in unit tests to verify the merkle computation.
+- **`jobs`** — Protocol-agnostic coinbase and merkle construction. `build_coinbase_parts` builds the coinbase split at the extranonce placeholder; `build_merkle_branch` computes sibling hashes in internal byte order. `pool/tests/fixtures/block_250000.json` is a real-block fixture for unit tests. Will gain a `build_sv2_job` function alongside the existing SV1 one.
 
 ### Planned modules (see ACTION_PLAN.md)
 
-`stratum` (TCP Stratum V1 server), `shares` (validation), `db` (SQLite).
+`stratum_sv2` (SV2 Mining Protocol server using `roles_logic_sv2` + `mining_sv2` + `noise_sv2`), `template_client` (SV2 Template Distribution Protocol, replacing `rpc`), `shares` (validation), `db` (SQLite).

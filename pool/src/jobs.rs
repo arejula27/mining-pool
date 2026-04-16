@@ -223,6 +223,94 @@ pub fn witness_commitment_script(hex: &str) -> ScriptBuf {
     ScriptBuf::from_bytes(bytes)
 }
 
+// ── SV2 extranonce constants ───────────────────────────────────────────────────
+
+/// Total bytes occupied by the extranonce area in an SV2 extended-channel coinbase.
+///
+/// SV2 layout:  coinbase_tx_prefix || extranonce_prefix(32) || extranonce2(4) || coinbase_tx_suffix
+pub const SV2_EXTRANONCE_PREFIX_SIZE: usize = 32;
+pub const SV2_EXTRANONCE2_SIZE: usize = 4;
+pub const SV2_EXTRANONCE_TOTAL: usize = SV2_EXTRANONCE_PREFIX_SIZE + SV2_EXTRANONCE2_SIZE;
+
+const SV2_EXTRANONCE_PLACEHOLDER: [u8; SV2_EXTRANONCE_TOTAL] = {
+    let mut b = [0u8; SV2_EXTRANONCE_TOTAL];
+    // Recognisable byte pattern so we can locate the placeholder after serialization.
+    let mut i = 0;
+    while i < SV2_EXTRANONCE_TOTAL {
+        b[i] = 0xcc;
+        i += 1;
+    }
+    b
+};
+
+/// Build coinbase parts for an SV2 extended channel.
+///
+/// The extranonce area is 36 bytes (32-byte prefix + 4-byte miner extranonce2).
+/// Full coinbase = `coinbase_tx_prefix || extranonce_prefix(32) || extranonce2(4) || coinbase_tx_suffix`
+pub fn build_sv2_coinbase_parts(
+    height: u32,
+    coinbase_value: i64,
+    miner_script: ScriptBuf,
+    witness_commitment_script: Option<ScriptBuf>,
+) -> CoinbaseParts {
+    let tx = build_coinbase_tx_sv2(height, coinbase_value, miner_script, witness_commitment_script);
+    let raw = serialize(&tx);
+    split_at_sv2_extranonce(raw)
+}
+
+fn build_coinbase_tx_sv2(
+    height: u32,
+    coinbase_value: i64,
+    miner_script: ScriptBuf,
+    witness_commitment_script: Option<ScriptBuf>,
+) -> Transaction {
+    let placeholder = PushBytesBuf::try_from(SV2_EXTRANONCE_PLACEHOLDER.to_vec())
+        .expect("SV2 extranonce placeholder is within push size limit");
+    let pool_tag = PushBytesBuf::try_from(POOL_TAG.to_vec())
+        .expect("pool tag is within push size limit");
+
+    let coinbase_script = Builder::new()
+        .push_int(height as i64)
+        .push_slice(pool_tag.as_ref())
+        .push_slice(placeholder.as_ref())
+        .into_script();
+
+    let input = TxIn {
+        previous_output: OutPoint::null(),
+        script_sig: coinbase_script,
+        sequence: Sequence::MAX,
+        witness: Witness::default(),
+    };
+
+    let miner_output = TxOut {
+        value: Amount::from_sat(coinbase_value as u64),
+        script_pubkey: miner_script,
+    };
+
+    let mut outputs = vec![miner_output];
+    if let Some(wc) = witness_commitment_script {
+        outputs.push(TxOut { value: Amount::ZERO, script_pubkey: wc });
+    }
+
+    Transaction {
+        version: Version::ONE,
+        lock_time: bitcoin::absolute::LockTime::ZERO,
+        input: vec![input],
+        output: outputs,
+    }
+}
+
+fn split_at_sv2_extranonce(raw: Vec<u8>) -> CoinbaseParts {
+    let pos = raw
+        .windows(SV2_EXTRANONCE_PLACEHOLDER.len())
+        .position(|w| w == SV2_EXTRANONCE_PLACEHOLDER)
+        .expect("SV2 extranonce placeholder not found in serialized coinbase");
+    CoinbaseParts {
+        coinb1: raw[..pos].to_vec(),
+        coinb2: raw[pos + SV2_EXTRANONCE_PLACEHOLDER.len()..].to_vec(),
+    }
+}
+
 // ── StratumJob assembly ────────────────────────────────────────────────────────
 
 pub fn build_stratum_job(
@@ -246,12 +334,15 @@ pub fn build_stratum_job(
 
     let branch = build_merkle_branch(&template.transactions);
 
-    let prevhash: String = hex::decode(&template.previousblockhash)
-        .expect("previousblockhash is not valid hex")
-        .iter()
-        .rev()
-        .map(|b| format!("{b:02x}"))
-        .collect();
+    // Stratum V1 prevhash: split the display-format hash into 4-byte words and
+    // reverse the bytes within each word (little-endian 32-bit groups).
+    // This differs from a full 32-byte reversal (which gives internal byte order).
+    let mut prevhash_bytes = hex::decode(&template.previousblockhash)
+        .expect("previousblockhash is not valid hex");
+    for chunk in prevhash_bytes.chunks_mut(4) {
+        chunk.reverse();
+    }
+    let prevhash = hex::encode(&prevhash_bytes);
 
     Ok(StratumJob {
         job_id: job_id.to_string(),
