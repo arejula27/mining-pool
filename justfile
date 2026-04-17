@@ -144,3 +144,13 @@ test-integration-tdp:
     just stop-all
     exit $EXIT
 alias int-tdp := test-integration-tdp
+
+# Run only the mine_block end-to-end test (full environment required)
+test-integration-mine:
+    #!/usr/bin/env bash
+    just start-all || exit 1
+    cargo test --manifest-path pool/Cargo.toml --test mine_block -- --nocapture --test-threads=1
+    EXIT=$?
+    just stop-all
+    exit $EXIT
+alias int-mine := test-integration-mine

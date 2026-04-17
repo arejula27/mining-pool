@@ -319,19 +319,24 @@ pub fn build_sv2_coinbase_from_tdp(
     coinbase_tx_outputs_bytes: &[u8],
     coinbase_tx_locktime: u32,
     miner_script: ScriptBuf,
+    use_segwit: bool,
 ) -> CoinbaseParts {
     let script_total_len = coinbase_script_prefix.len() + SV2_EXTRANONCE_TOTAL;
 
     // ── prefix: everything up to (but not including) the extranonce ──
     let mut prefix = Vec::new();
     prefix.extend_from_slice(&coinbase_tx_version.to_le_bytes());
+    // Segwit wire format inserts marker (0x00) and flag (0x01) before vin count.
+    if use_segwit {
+        prefix.extend_from_slice(&[0x00, 0x01]);
+    }
     prefix.push(1u8); // vin count
     prefix.extend_from_slice(&[0u8; 32]); // prevout hash (all zero = coinbase)
     prefix.extend_from_slice(&0xffff_ffffu32.to_le_bytes()); // prevout index
     write_varint(&mut prefix, script_total_len as u64);
     prefix.extend_from_slice(coinbase_script_prefix);
 
-    // ── suffix: input sequence, outputs, locktime ──
+    // ── suffix: input sequence, outputs, witness nonce (segwit), locktime ──
     let mut suffix = Vec::new();
     suffix.extend_from_slice(&coinbase_tx_input_sequence.to_le_bytes());
 
@@ -347,6 +352,14 @@ pub fn build_sv2_coinbase_from_tdp(
 
     // sv2-tp's additional outputs (e.g. witness commitment OP_RETURN)
     suffix.extend_from_slice(coinbase_tx_outputs_bytes);
+
+    // BIP141: coinbase witness = 1 item of 32 zero bytes (witness nonce).
+    if use_segwit {
+        suffix.push(0x01); // one witness item for the single input
+        suffix.push(0x20); // item length = 32 bytes
+        suffix.extend_from_slice(&[0u8; 32]); // witness nonce (all zeros)
+    }
+
     suffix.extend_from_slice(&coinbase_tx_locktime.to_le_bytes());
 
     CoinbaseParts { coinb1: prefix, coinb2: suffix }

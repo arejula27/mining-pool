@@ -473,6 +473,7 @@ fn build_job_messages(
     // Build per-channel coinbase from TDP data.
     let miner_script = script_from_address(&channel.miner_address)
         .with_context(|| format!("invalid miner address: {}", channel.miner_address))?;
+    let use_segwit = coinbase_tx_outputs_count > 0;
     let parts = build_sv2_coinbase_from_tdp(
         &coinbase_script_prefix,
         coinbase_tx_version,
@@ -482,6 +483,7 @@ fn build_job_messages(
         &coinbase_tx_outputs_bytes,
         coinbase_tx_locktime,
         miner_script,
+        use_segwit,
     );
 
     let coinbase_tx_prefix =
