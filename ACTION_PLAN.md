@@ -66,9 +66,9 @@ Crates ya en `Cargo.toml`: `template_distribution_sv2 = "5.0.0"`. Añadir: `stra
 - [x] Remove `TemplatePoller` and dead SV1 code (`StratumJob`, `build_stratum_job`) from codebase
 - [x] Add `sv2-tp` binary to `flake.nix`; `just start-all` / `just stop-all` recipes
 - [x] Write `bitcoin/sv2-tp.conf`; integration test `tests/template_client.rs`
-- [ ] Fix `build_sv2_coinbase_from_tdp` for segwit: add `use_segwit: bool` param (true when `coinbase_tx_outputs_count > 0`); insert marker/flag bytes in prefix; append 32-byte witness nonce before locktime in suffix
-- [ ] Write `pool/tests/mine_block.rs`: receive `RawTemplate` from sv2-tp → build segwit coinbase → brute-force nonce → submit via RPC → assert block height increased
-- [ ] Send `SubmitSolution` to sv2-tp when a block is found (Paso 5)
+- [x] Fix `build_sv2_coinbase_from_tdp` for segwit: add `use_segwit: bool` param (true when `coinbase_tx_outputs_count > 0`); insert marker/flag bytes in prefix; append 32-byte witness nonce before locktime in suffix
+- [x] Write `pool/tests/mine_block.rs`: receive `RawTemplate` → build segwit coinbase → mine nonce → send `SubmitSolution` to sv2-tp → sv2-tp reconstructs block and calls `submitblock` → assert height increased
+- [x] Expose `mpsc::Sender<SubmitSolutionData>` from `template_client::start`; background `io_loop` owns `NoiseWriteHalf` and sends `SubmitSolution` on demand
 
 ## Paso 4c — Servidor SV2 Mining Protocol
 La pool habla SV2 Extended Channel con el translator. Los Bitaxes se conectan al translator.

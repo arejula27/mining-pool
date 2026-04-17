@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 
 use anyhow::{bail, Context, Result};
-use binary_sv2::Str0255;
+use binary_sv2::{B064K, Str0255};
 use codec_sv2::HandshakeRole;
 use common_messages_sv2::{
     Protocol, SetupConnection, MESSAGE_TYPE_SETUP_CONNECTION,
@@ -11,10 +11,10 @@ use framing_sv2::framing::Frame;
 use noise_sv2::Initiator;
 use secp256k1::{Keypair, Secp256k1, SecretKey};
 use template_distribution_sv2::{
-    CoinbaseOutputConstraints, MESSAGE_TYPE_COINBASE_OUTPUT_CONSTRAINTS, MESSAGE_TYPE_NEW_TEMPLATE,
-    MESSAGE_TYPE_SET_NEW_PREV_HASH,
+    CoinbaseOutputConstraints, SubmitSolution, MESSAGE_TYPE_COINBASE_OUTPUT_CONSTRAINTS,
+    MESSAGE_TYPE_NEW_TEMPLATE, MESSAGE_TYPE_SET_NEW_PREV_HASH, MESSAGE_TYPE_SUBMIT_SOLUTION,
 };
-use tokio::{net::TcpStream, sync::watch};
+use tokio::{net::TcpStream, sync::{mpsc, watch}};
 use tracing::{info, warn};
 
 use crate::noise_connection::{connect_noise, NoiseReadHalf, NoiseWriteHalf};
@@ -29,6 +29,16 @@ pub const TP_REGTEST_PORT: u16 = 18447;
 pub struct RawTemplate {
     pub new_template: Vec<u8>,
     pub set_new_prev_hash: Vec<u8>,
+}
+
+/// Data needed to send a `SubmitSolution` to sv2-tp after mining a valid block.
+pub struct SubmitSolutionData {
+    pub template_id: u64,
+    pub version: u32,
+    pub header_timestamp: u32,
+    pub header_nonce: u32,
+    /// Full serialized coinbase transaction with the actual extranonce filled in.
+    pub coinbase_tx: Vec<u8>,
 }
 
 /// Read the sv2-tp authority public key from the bitcoin data dir.
@@ -52,13 +62,13 @@ pub fn read_authority_pubkey(datadir: &str) -> Result<[u8; 32]> {
 
 /// Connect to sv2-tp, receive the first template pair, then stream further updates.
 ///
-/// Mirrors `TemplatePoller::start`: blocks until the first `NewTemplate` + `SetNewPrevHash`
-/// pair is received, then returns a `watch::Receiver` and spawns a background task.
+/// Returns a `watch::Receiver` that is updated on each new template pair, and an
+/// `mpsc::Sender` to send `SubmitSolution` messages back to sv2-tp when a block is found.
 pub async fn start(
     tp_addr: SocketAddr,
     authority_pubkey: [u8; 32],
     coinbase_output_max_size: u32,
-) -> Result<watch::Receiver<RawTemplate>> {
+) -> Result<(watch::Receiver<RawTemplate>, mpsc::Sender<SubmitSolutionData>)> {
     let stream = TcpStream::connect(tp_addr)
         .await
         .context("TCP connect to sv2-tp")?;
@@ -77,15 +87,72 @@ pub async fn start(
     let first = recv_until_pair(&mut reader).await?;
     info!("sv2-tp: first template pair received");
 
-    let (tx, rx) = watch::channel(first);
+    let (template_tx, template_rx) = watch::channel(first);
+    let (solution_tx, solution_rx) = mpsc::channel::<SubmitSolutionData>(8);
 
     tokio::spawn(async move {
-        if let Err(e) = recv_loop(reader, tx).await {
-            tracing::error!("sv2-tp template stream ended: {e:#}");
+        if let Err(e) = io_loop(reader, writer, template_tx, solution_rx).await {
+            tracing::error!("sv2-tp io loop ended: {e:#}");
         }
     });
 
-    Ok(rx)
+    Ok((template_rx, solution_tx))
+}
+
+/// Background task: receives template updates and sends SubmitSolution messages.
+async fn io_loop(
+    mut reader: NoiseReadHalf,
+    mut writer: NoiseWriteHalf,
+    template_tx: watch::Sender<RawTemplate>,
+    mut solution_rx: mpsc::Receiver<SubmitSolutionData>,
+) -> Result<()> {
+    let mut pending: Option<Vec<u8>> = None;
+
+    loop {
+        tokio::select! {
+            result = next_msg(&mut reader) => {
+                let (msg_type, payload) = result?;
+                match msg_type {
+                    MESSAGE_TYPE_NEW_TEMPLATE => {
+                        info!("sv2-tp: NewTemplate");
+                        pending = Some(payload);
+                    }
+                    MESSAGE_TYPE_SET_NEW_PREV_HASH => {
+                        info!("sv2-tp: SetNewPrevHash");
+                        if let Some(new_template) = pending.take() {
+                            if template_tx.send(RawTemplate {
+                                new_template,
+                                set_new_prev_hash: payload,
+                            }).is_err() {
+                                break; // all receivers dropped
+                            }
+                        } else {
+                            warn!("sv2-tp: SetNewPrevHash without pending NewTemplate — ignoring");
+                        }
+                    }
+                    other => warn!(msg_type = other, "sv2-tp: unexpected message"),
+                }
+            }
+            Some(sol) = solution_rx.recv() => {
+                send_submit_solution(&mut writer, sol).await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn send_submit_solution(writer: &mut NoiseWriteHalf, data: SubmitSolutionData) -> Result<()> {
+    let coinbase_tx = B064K::try_from(data.coinbase_tx)
+        .map_err(|e| anyhow::anyhow!("coinbase_tx for SubmitSolution: {e:?}"))?;
+    let msg = SubmitSolution {
+        template_id: data.template_id,
+        version: data.version,
+        header_timestamp: data.header_timestamp,
+        header_nonce: data.header_nonce,
+        coinbase_tx,
+    };
+    info!(template_id = msg.template_id, header_nonce = msg.header_nonce, "sv2-tp: SubmitSolution");
+    writer.write_sv2_message(msg, MESSAGE_TYPE_SUBMIT_SOLUTION, false).await
 }
 
 /// Receive messages until one complete NewTemplate + SetNewPrevHash pair is available.
@@ -107,33 +174,6 @@ async fn recv_until_pair(reader: &mut NoiseReadHalf) -> Result<RawTemplate> {
             other => warn!(msg_type = other, "sv2-tp: unexpected message during setup"),
         }
     }
-}
-
-/// Background loop: continues pairing NewTemplate + SetNewPrevHash and sending on `tx`.
-async fn recv_loop(mut reader: NoiseReadHalf, tx: watch::Sender<RawTemplate>) -> Result<()> {
-    let mut pending: Option<Vec<u8>> = None;
-
-    loop {
-        let (msg_type, payload) = next_msg(&mut reader).await?;
-        match msg_type {
-            MESSAGE_TYPE_NEW_TEMPLATE => {
-                info!("sv2-tp: NewTemplate");
-                pending = Some(payload);
-            }
-            MESSAGE_TYPE_SET_NEW_PREV_HASH => {
-                info!("sv2-tp: SetNewPrevHash");
-                if let Some(new_template) = pending.take() {
-                    if tx.send(RawTemplate { new_template, set_new_prev_hash: payload }).is_err() {
-                        break; // all receivers dropped, pool shutting down
-                    }
-                } else {
-                    warn!("sv2-tp: SetNewPrevHash without pending NewTemplate — ignoring");
-                }
-            }
-            other => warn!(msg_type = other, "sv2-tp: unexpected message"),
-        }
-    }
-    Ok(())
 }
 
 async fn next_msg(reader: &mut NoiseReadHalf) -> Result<(u8, Vec<u8>)> {

@@ -78,6 +78,34 @@
 					meta.platforms = [ "x86_64-linux" ];
 				};
 
+				# SV2 Translator — bridges SV1 miners (Bitaxe/NerdAxe) to our SV2 pool.
+				# Statically linked musl binary; no ELF patching needed.
+				translator-sv2 = pkgs.stdenv.mkDerivation {
+					pname = "translator-sv2";
+					version = "0.3.4";
+
+					src = pkgs.fetchurl {
+						url = "https://github.com/stratum-mining/sv2-apps/releases/download/v0.3.4/miner-apps-x86_64-unknown-linux-musl.tar.gz";
+						hash = "sha256-kREY8TQ8t5CA8MT/h4ncsMd7w9tv6BnYyfU8jFv3r1A=";
+					};
+
+					unpackPhase = ''
+						runHook preUnpack
+						mkdir unpacked
+						tar -xzf "$src" -C unpacked
+						runHook postUnpack
+					'';
+
+					installPhase = ''
+						runHook preInstall
+						mkdir -p "$out/bin"
+						cp unpacked/translator/translator_sv2 "$out/bin/translator_sv2"
+						runHook postInstall
+					'';
+
+					meta.platforms = [ "x86_64-linux" ];
+				};
+
 			in
 			{
 				devShells.default = pkgs.mkShell {
@@ -90,6 +118,9 @@
 
 						# SV2 Template Provider
 						sv2-tp
+
+						# SV2 Translator (SV1↔SV2 bridge)
+						translator-sv2
 
 						# Task runner
 						pkgs.just

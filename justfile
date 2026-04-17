@@ -1,9 +1,12 @@
-data_dir       := justfile_directory() / ".bitcoin-data"
-conf           := justfile_directory() / "bitcoin" / "bitcoin.conf"
-sv2_tp_conf    := justfile_directory() / "bitcoin" / "sv2-tp.conf"
-cli            := "bitcoin-cli -datadir=" + data_dir
-pid_file       := justfile_directory() / ".bitcoin-node.pid"
-sv2_tp_pid     := justfile_directory() / ".sv2-tp.pid"
+data_dir            := justfile_directory() / ".bitcoin-data"
+conf                := justfile_directory() / "bitcoin" / "bitcoin.conf"
+sv2_tp_conf         := justfile_directory() / "bitcoin" / "sv2-tp.conf"
+translator_conf_tmpl := justfile_directory() / "bitcoin" / "translator.toml"
+translator_conf_rt  := justfile_directory() / ".translator-runtime.toml"
+cli                 := "bitcoin-cli -datadir=" + data_dir
+pid_file            := justfile_directory() / ".bitcoin-node.pid"
+sv2_tp_pid          := justfile_directory() / ".sv2-tp.pid"
+translator_pid      := justfile_directory() / ".translator.pid"
 
 # List all available recipes
 default:
@@ -78,16 +81,49 @@ kill-sv2-tp:
 sv2-tp:
     sv2-tp -datadir={{data_dir}} -conf={{sv2_tp_conf}}
 
+# ── Translator ────────────────────────────────────────────────────────────────
+
+# Start the SV1↔SV2 translator (requires pool already running on :3333)
+start-translator:
+    #!/usr/bin/env bash
+    if ! command -v translator_sv2 &>/dev/null; then
+        echo "translator_sv2 not found — run from inside nix develop" >&2
+        exit 1
+    fi
+    [ -f .env ] && set -a && source .env && set +a
+    PUBKEY_HEX="${POOL_AUTHORITY_PUBLIC_KEY}"
+    if [ -z "$PUBKEY_HEX" ]; then
+        echo "POOL_AUTHORITY_PUBLIC_KEY not set — run just keygen first" >&2
+        exit 1
+    fi
+    PUBKEY_B58=$(python3 bitcoin/hex_to_b58.py "$PUBKEY_HEX")
+    sed "s/AUTHORITY_PUBKEY_PLACEHOLDER/$PUBKEY_B58/" {{translator_conf_tmpl}} > {{translator_conf_rt}}
+    nohup translator_sv2 -c {{translator_conf_rt}} \
+        > {{data_dir}}/translator.log 2>&1 &
+    echo $! > {{translator_pid}}
+    echo "Waiting for translator on :34255..."
+    until ss -tlnp 2>/dev/null | grep -q 34255; do sleep 0.5; done
+    echo "translator ready"
+
+# Stop the translator
+stop-translator:
+    @if [ -f {{translator_pid}} ]; then kill $(cat {{translator_pid}}) 2>/dev/null || true; rm -f {{translator_pid}}; fi
+
+# Force-kill translator
+kill-translator:
+    @if [ -f {{translator_pid}} ]; then kill $(cat {{translator_pid}}) 2>/dev/null || true; rm -f {{translator_pid}}; fi
+    pkill translator_sv2 || true
+
 # ── Full environment ──────────────────────────────────────────────────────────
 
-# Start bitcoin-node and sv2-tp (full environment)
+# Start bitcoin-node and sv2-tp (full environment, without translator)
 start-all: start start-sv2-tp
 
 # Stop sv2-tp then bitcoin-node
 stop-all: stop-sv2-tp stop
 
 # Force-kill everything
-kill-all: kill-sv2-tp kill
+kill-all: kill-translator kill-sv2-tp kill
 
 # ── Pool ──────────────────────────────────────────────────────────────────────
 
@@ -154,3 +190,13 @@ test-integration-mine:
     just stop-all
     exit $EXIT
 alias int-mine := test-integration-mine
+
+# Run the sv1_miner end-to-end test (starts bitcoin-node + sv2-tp, pool and translator are spawned by the test)
+test-integration-sv1:
+    #!/usr/bin/env bash
+    just start-all || exit 1
+    cargo test --manifest-path pool/Cargo.toml --test sv1_miner -- --nocapture --test-threads=1
+    EXIT=$?
+    just stop-all
+    exit $EXIT
+alias int-sv1 := test-integration-sv1

@@ -114,7 +114,7 @@ async fn sv2_server_open_extended_channel() {
 
     let tp_authority_pubkey = template_client::read_authority_pubkey(&datadir())
         .expect("read sv2_authority_key — run `just start-all` first");
-    let template_rx = template_client::start(
+    let (template_rx, solution_tx) = template_client::start(
         "127.0.0.1:18447".parse().unwrap(),
         tp_authority_pubkey,
         100,
@@ -123,7 +123,7 @@ async fn sv2_server_open_extended_channel() {
     .expect("connect to sv2-tp");
 
     let listen_addr: SocketAddr = format!("127.0.0.1:{SV2_TEST_PORT}").parse().unwrap();
-    let server = Sv2Server::new(authority, listen_addr, template_rx, pool_addr);
+    let server = Sv2Server::new(authority, listen_addr, template_rx, pool_addr, solution_tx);
 
     tokio::spawn(async move {
         if let Err(e) = server.run().await {

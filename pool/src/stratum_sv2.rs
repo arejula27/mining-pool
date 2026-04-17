@@ -16,6 +16,11 @@ use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 
 use anyhow::{bail, Context, Result};
 use binary_sv2::{B032, B064K, Seq0255, Sv2Option, U256};
+use bitcoin::{
+    block::{Header, Version as BlockVersion},
+    hashes::{sha256d, Hash},
+    CompactTarget, TxMerkleNode,
+};
 use codec_sv2::HandshakeRole;
 use common_messages_sv2::{
     Protocol, SetupConnection, SetupConnectionError, SetupConnectionSuccess,
@@ -25,18 +30,20 @@ use common_messages_sv2::{
 use framing_sv2::framing::{Frame, Sv2Frame};
 use mining_sv2::{
     NewExtendedMiningJob, OpenExtendedMiningChannel, OpenExtendedMiningChannelSuccess,
-    SetNewPrevHash, MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB, MESSAGE_TYPE_MINING_SET_NEW_PREV_HASH,
+    SetNewPrevHash, SubmitSharesExtended, SubmitSharesSuccess,
+    MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB, MESSAGE_TYPE_MINING_SET_NEW_PREV_HASH,
     MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL, MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL_SUCCESS,
+    MESSAGE_TYPE_SUBMIT_SHARES_EXTENDED, MESSAGE_TYPE_SUBMIT_SHARES_SUCCESS,
 };
 use noise_sv2::Responder;
 use template_distribution_sv2::NewTemplate;
-use tokio::{net::TcpListener, sync::watch};
+use tokio::{net::TcpListener, sync::{mpsc, watch}};
 use tracing::{error, info, warn};
 
 use crate::{
-    jobs::{build_sv2_coinbase_from_tdp, script_from_address, SV2_EXTRANONCE2_SIZE},
+    jobs::{build_sv2_coinbase_from_tdp, script_from_address, SV2_EXTRANONCE2_SIZE, SV2_EXTRANONCE_TOTAL},
     noise_connection::{accept_noise, EitherFrame, NoiseWriteHalf},
-    template_client::RawTemplate,
+    template_client::{RawTemplate, SubmitSolutionData},
 };
 
 // ── Pool authority keypair ────────────────────────────────────────────────────
@@ -59,14 +66,28 @@ impl AuthorityKeypair {
 
 // ── Per-connection state ──────────────────────────────────────────────────────
 
+/// All data needed to validate a share for a specific job.
+struct JobInfo {
+    job_id: u32,
+    template_id: u64,
+    coinb1: Vec<u8>,
+    coinb2: Vec<u8>,
+    merkle_path: Vec<[u8; 32]>,
+    prev_hash: [u8; 32],
+    nbits: u32,
+    ntime: u32,
+    version: u32,
+}
+
 /// State for a single open extended channel.
 struct ChannelInfo {
     channel_id: u32,
-    /// First 4 bytes of extranonce_prefix; used in Paso 5 to reconstruct the coinbase.
-    #[allow(dead_code)]
+    /// First 4 bytes of extranonce_prefix used to reconstruct the coinbase.
     extranonce1: [u8; 4],
     /// Bitcoin address for this miner's coinbase output.
     miner_address: String,
+    /// Most recent job sent to this channel.
+    current_job: Option<JobInfo>,
 }
 
 /// Mutable state for one TCP connection (multiple channels can be multiplexed).
@@ -108,6 +129,7 @@ pub struct Sv2Server {
     listen_addr: SocketAddr,
     template_rx: watch::Receiver<RawTemplate>,
     pool_address: String,
+    solution_tx: mpsc::Sender<SubmitSolutionData>,
 }
 
 impl Sv2Server {
@@ -116,12 +138,14 @@ impl Sv2Server {
         listen_addr: SocketAddr,
         template_rx: watch::Receiver<RawTemplate>,
         pool_address: String,
+        solution_tx: mpsc::Sender<SubmitSolutionData>,
     ) -> Self {
         Self {
             keypair: Arc::new(keypair),
             listen_addr,
             template_rx,
             pool_address,
+            solution_tx,
         }
     }
 
@@ -140,10 +164,11 @@ impl Sv2Server {
             let keypair = Arc::clone(&self.keypair);
             let template_rx = self.template_rx.clone();
             let pool_address = self.pool_address.clone();
+            let solution_tx = self.solution_tx.clone();
 
             tokio::spawn(async move {
                 if let Err(e) =
-                    handle_connection(stream, peer_addr, &keypair, template_rx, pool_address).await
+                    handle_connection(stream, peer_addr, &keypair, template_rx, pool_address, solution_tx).await
                 {
                     warn!(%peer_addr, "Connection error: {e:#}");
                 }
@@ -160,6 +185,7 @@ async fn handle_connection(
     keypair: &AuthorityKeypair,
     mut template_rx: watch::Receiver<RawTemplate>,
     pool_address: String,
+    solution_tx: mpsc::Sender<SubmitSolutionData>,
 ) -> Result<()> {
     let responder = keypair.to_responder()?;
     let role = HandshakeRole::Responder(responder);
@@ -187,7 +213,7 @@ async fn handle_connection(
                     }
                 };
                 let template = template_rx.borrow().clone();
-                if let Err(e) = dispatch_message(frame, &mut writer, &mut state, &template, peer_addr).await {
+                if let Err(e) = dispatch_message(frame, &mut writer, &mut state, &template, peer_addr, &solution_tx).await {
                     error!(%peer_addr, "Message error: {e:#}");
                     return Err(e);
                 }
@@ -197,7 +223,7 @@ async fn handle_connection(
                 info!(%peer_addr, "Template updated, broadcasting new jobs");
                 let job_id = state.next_job_id;
                 state.next_job_id += 1;
-                if let Err(e) = send_jobs_to_all_channels(&mut writer, &state, &template, job_id).await {
+                if let Err(e) = send_jobs_to_all_channels(&mut writer, &mut state, &template, job_id).await {
                     error!(%peer_addr, "Error broadcasting jobs: {e:#}");
                 }
             }
@@ -303,6 +329,7 @@ async fn dispatch_message(
     state: &mut ConnectionState,
     template: &RawTemplate,
     peer_addr: SocketAddr,
+    solution_tx: &mpsc::Sender<SubmitSolutionData>,
 ) -> Result<()> {
     let sv2_frame = match frame {
         Frame::Sv2(f) => f,
@@ -314,6 +341,9 @@ async fn dispatch_message(
     match header.msg_type() {
         MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL => {
             handle_open_extended_mining_channel(sv2_frame, writer, state, template, peer_addr).await
+        }
+        MESSAGE_TYPE_SUBMIT_SHARES_EXTENDED => {
+            handle_submit_shares_extended(sv2_frame, writer, state, peer_addr, solution_tx).await
         }
         other => {
             warn!(
@@ -382,13 +412,14 @@ async fn handle_open_extended_mining_channel(
     info!(%peer_addr, channel_id, "OpenExtendedMiningChannelSuccess sent");
 
     // Register the channel.
-    let channel = ChannelInfo { channel_id, extranonce1, miner_address };
+    let channel = ChannelInfo { channel_id, extranonce1, miner_address, current_job: None };
     state.channels.insert(channel_id, channel);
 
     // Send the first job immediately.
     let job_id = state.alloc_job_id();
     let channel = state.channels.get(&channel_id).unwrap();
-    let (prev_hash, job) = build_job_messages(channel, job_id, template)?;
+    let (prev_hash, job, job_info) = build_job_messages(channel, job_id, template)?;
+    state.channels.get_mut(&channel_id).unwrap().current_job = Some(job_info);
 
     writer
         .write_sv2_message(prev_hash, MESSAGE_TYPE_MINING_SET_NEW_PREV_HASH, true)
@@ -405,15 +436,18 @@ async fn handle_open_extended_mining_channel(
 
 // ── Job broadcast ─────────────────────────────────────────────────────────────
 
-/// Send new SetNewPrevHash + NewExtendedMiningJob to every open channel.
+/// Send new SetNewPrevHash + NewExtendedMiningJob to every open channel, updating stored job info.
 async fn send_jobs_to_all_channels(
     writer: &mut NoiseWriteHalf,
-    state: &ConnectionState,
+    state: &mut ConnectionState,
     template: &RawTemplate,
     job_id: u32,
 ) -> Result<()> {
-    for channel in state.channels.values() {
-        let (prev_hash, job) = build_job_messages(channel, job_id, template)?;
+    let channel_ids: Vec<u32> = state.channels.keys().cloned().collect();
+    for channel_id in channel_ids {
+        let channel = state.channels.get(&channel_id).unwrap();
+        let (prev_hash, job, job_info) = build_job_messages(channel, job_id, template)?;
+        state.channels.get_mut(&channel_id).unwrap().current_job = Some(job_info);
         writer
             .write_sv2_message(prev_hash, MESSAGE_TYPE_MINING_SET_NEW_PREV_HASH, true)
             .await
@@ -428,12 +462,12 @@ async fn send_jobs_to_all_channels(
 
 // ── Job construction ──────────────────────────────────────────────────────────
 
-/// Build `SetNewPrevHash` + `NewExtendedMiningJob` for a single channel from TDP data.
+/// Build `SetNewPrevHash` + `NewExtendedMiningJob` + `JobInfo` for a single channel from TDP data.
 fn build_job_messages(
     channel: &ChannelInfo,
     job_id: u32,
     raw: &RawTemplate,
-) -> Result<(SetNewPrevHash<'static>, NewExtendedMiningJob<'static>)> {
+) -> Result<(SetNewPrevHash<'static>, NewExtendedMiningJob<'static>, JobInfo)> {
     // Deserialize TDP payloads (bytes are cloned so parsed types can borrow from them).
     let mut nt_bytes = raw.new_template.clone();
     let mut snph_bytes = raw.set_new_prev_hash.clone();
@@ -454,18 +488,25 @@ fn build_job_messages(
     let version = nt.version;
 
     // Seq0255<U256<'_>>.inner_as_ref() → Vec<&[u8]>, one slice per 32-byte hash.
-    let path_hashes: Vec<U256<'static>> = nt
+    let path_hashes_raw: Vec<[u8; 32]> = nt
         .merkle_path
         .inner_as_ref()
         .into_iter()
         .map(|bytes| {
             let mut h = [0u8; 32];
             h.copy_from_slice(bytes);
-            U256::from(h)
+            h
         })
         .collect();
+    let path_hashes: Vec<U256<'static>> = path_hashes_raw
+        .iter()
+        .map(|h| U256::from(*h))
+        .collect();
 
-    let prev_hash = U256::try_from(snph.prev_hash.inner_as_ref().to_vec())
+    let prev_hash_bytes: [u8; 32] = snph.prev_hash.inner_as_ref()
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("prev_hash must be 32 bytes"))?;
+    let prev_hash = U256::try_from(prev_hash_bytes.to_vec())
         .map_err(|e| anyhow::anyhow!("prev_hash: {e:?}"))?;
     let header_timestamp = snph.header_timestamp;
     let nbits = snph.n_bits;
@@ -486,6 +527,8 @@ fn build_job_messages(
         use_segwit,
     );
 
+    let coinb1_raw = parts.coinb1.clone();
+    let coinb2_raw = parts.coinb2.clone();
     let coinbase_tx_prefix =
         B064K::try_from(parts.coinb1).map_err(|e| anyhow::anyhow!("coinbase prefix: {e:?}"))?;
     let coinbase_tx_suffix =
@@ -512,7 +555,142 @@ fn build_job_messages(
         coinbase_tx_suffix,
     };
 
-    Ok((mining_snph, job))
+    // Keep a copy for share validation (JobInfo stores raw Vec<u8> / [u8;32] values
+    // extracted earlier, so there are no lifetime issues).
+    let job_info = JobInfo {
+        job_id,
+        template_id: nt.template_id,
+        coinb1: coinb1_raw,
+        coinb2: coinb2_raw,
+        merkle_path: path_hashes_raw,
+        prev_hash: prev_hash_bytes,
+        nbits,
+        ntime: header_timestamp,
+        version,
+    };
+
+    Ok((mining_snph, job, job_info))
+}
+
+// ── Share submission ──────────────────────────────────────────────────────────
+
+async fn handle_submit_shares_extended(
+    mut frame: Sv2Frame<u32, Vec<u8>>,
+    writer: &mut NoiseWriteHalf,
+    state: &mut ConnectionState,
+    peer_addr: SocketAddr,
+    solution_tx: &mpsc::Sender<SubmitSolutionData>,
+) -> Result<()> {
+    let share: SubmitSharesExtended<'_> =
+        binary_sv2::from_bytes(frame.payload())
+            .map_err(|e| anyhow::anyhow!("SubmitSharesExtended parse error: {e:?}"))?;
+
+    let channel_id = share.channel_id;
+    let sequence_number = share.sequence_number;
+
+    info!(
+        %peer_addr,
+        channel_id,
+        sequence_number,
+        job_id = share.job_id,
+        nonce = share.nonce,
+        "SubmitSharesExtended"
+    );
+
+    let channel = match state.channels.get(&channel_id) {
+        Some(c) => c,
+        None => {
+            warn!(%peer_addr, channel_id, "SubmitSharesExtended: unknown channel");
+            return Ok(());
+        }
+    };
+
+    let job = match &channel.current_job {
+        Some(j) => j,
+        None => {
+            warn!(%peer_addr, channel_id, "SubmitSharesExtended: no current job");
+            return Ok(());
+        }
+    };
+
+    // Reconstruct coinbase: coinb1 + extranonce_prefix(32) + extranonce2(4) + coinb2
+    let mut full_extranonce = [0u8; SV2_EXTRANONCE_TOTAL];
+    full_extranonce[..4].copy_from_slice(&channel.extranonce1);
+    let ext2 = share.extranonce.inner_as_ref();
+    let ext2_len = ext2.len().min(SV2_EXTRANONCE_TOTAL - 32);
+    full_extranonce[32..32 + ext2_len].copy_from_slice(&ext2[..ext2_len]);
+
+    let mut coinbase = job.coinb1.clone();
+    coinbase.extend_from_slice(&full_extranonce);
+    coinbase.extend_from_slice(&job.coinb2);
+
+    // Compute coinbase TXID (non-witness hash) and merkle root.
+    let coinbase_tx: bitcoin::Transaction = match bitcoin::consensus::deserialize(&coinbase) {
+        Ok(tx) => tx,
+        Err(e) => {
+            warn!(%peer_addr, "SubmitSharesExtended: coinbase deserialization failed: {e}");
+            return Ok(());
+        }
+    };
+    let mut hash: [u8; 32] = coinbase_tx.compute_txid().to_byte_array();
+    for sibling in &job.merkle_path {
+        let mut data = [0u8; 64];
+        data[..32].copy_from_slice(&hash);
+        data[32..].copy_from_slice(sibling);
+        hash = sha256d::Hash::hash(&data).to_byte_array();
+    }
+    let merkle_root = TxMerkleNode::from_byte_array(hash);
+
+    let header = Header {
+        version: BlockVersion::from_consensus(share.version as i32),
+        prev_blockhash: bitcoin::BlockHash::from_byte_array(job.prev_hash),
+        merkle_root,
+        time: share.ntime,
+        bits: CompactTarget::from_consensus(job.nbits),
+        nonce: share.nonce,
+    };
+
+    let block_hash = header.block_hash().to_string();
+    let target_hex = compact_to_target_hex(job.nbits);
+
+    if block_hash <= target_hex {
+        info!(%peer_addr, channel_id, "Block-level share found! Sending SubmitSolution");
+        let _ = solution_tx.send(SubmitSolutionData {
+            template_id: job.template_id,
+            version: share.version,
+            header_timestamp: share.ntime,
+            header_nonce: share.nonce,
+            coinbase_tx: coinbase,
+        }).await;
+    }
+
+    // Accept every share (no per-share difficulty filter yet).
+    let success = SubmitSharesSuccess {
+        channel_id,
+        last_sequence_number: sequence_number,
+        new_submits_accepted_count: 1,
+        new_shares_sum: 1,
+    };
+    writer
+        .write_sv2_message(success, MESSAGE_TYPE_SUBMIT_SHARES_SUCCESS, true)
+        .await
+        .context("send SubmitSharesSuccess")?;
+
+    Ok(())
+}
+
+/// Convert compact bits to a 32-byte big-endian target as a lowercase hex string.
+fn compact_to_target_hex(bits: u32) -> String {
+    let exp = (bits >> 24) as usize;
+    let mantissa = bits & 0x007f_ffff;
+    let mut be = [0u8; 32];
+    if exp >= 3 && exp <= 32 {
+        let i = 32 - exp;
+        if i < 32     { be[i]   = ((mantissa >> 16) & 0xff) as u8; }
+        if i + 1 < 32 { be[i+1] = ((mantissa >> 8)  & 0xff) as u8; }
+        if i + 2 < 32 { be[i+2] = (mantissa          & 0xff) as u8; }
+    }
+    hex::encode(be)
 }
 
 /// Extract the channel target from the TDP SetNewPrevHash payload.

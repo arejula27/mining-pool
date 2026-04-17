@@ -1,22 +1,26 @@
-//! End-to-end block mining test.
+//! End-to-end block mining test via the Template Distribution Protocol.
 //!
-//! Connects to sv2-tp to get the coinbase template (TDP path), fetches transaction
-//! data from the RPC node, mines a valid nonce (regtest difficulty), and submits
-//! the block via RPC.
+//! Flow:
+//!   sv2-tp ──NewTemplate/SetNewPrevHash──▶ pool (template_client)
+//!   pool builds coinbase, mines nonce
+//!   pool ──SubmitSolution──▶ sv2-tp ──submitblock──▶ bitcoin-core
+//!   assert block height increased
 //!
 //! Requires `just start-all` (bitcoind + sv2-tp) to be running.
 //! Run with: `just int-mine`
 
+use std::time::Duration;
+
 use bitcoin::{
     block::{Header, Version as BlockVersion},
-    consensus::{deserialize, serialize},
+    consensus::deserialize,
     hashes::{sha256d, Hash},
-    CompactTarget, TxMerkleNode, Transaction,
+    CompactTarget, TxMerkleNode,
 };
 use pool::{
     jobs::{build_sv2_coinbase_from_tdp, script_from_address, SV2_EXTRANONCE_TOTAL},
     rpc::RpcClient,
-    template_client,
+    template_client::{self, SubmitSolutionData},
 };
 use template_distribution_sv2::{NewTemplate, SetNewPrevHash};
 
@@ -57,7 +61,7 @@ async fn mine_block_from_sv2_template() {
     let pub_key = template_client::read_authority_pubkey(&datadir())
         .expect("read sv2_authority_key — run `just start-all` first");
 
-    let template_rx = template_client::start(
+    let (template_rx, solution_tx) = template_client::start(
         "127.0.0.1:18447".parse().unwrap(),
         pub_key,
         100,
@@ -100,14 +104,14 @@ async fn mine_block_from_sv2_template() {
     coinbase_bytes.extend_from_slice(&[0u8; SV2_EXTRANONCE_TOTAL]);
     coinbase_bytes.extend_from_slice(&parts.coinb2);
 
-    let coinbase_tx: Transaction = deserialize(&coinbase_bytes)
+    // Verify it parses as a valid transaction.
+    let coinbase_tx: bitcoin::Transaction = deserialize(&coinbase_bytes)
         .expect("coinbase must be a valid Bitcoin transaction");
     assert!(coinbase_tx.input[0].previous_output.is_null());
 
-    // ── Compute merkle root by applying the TDP merkle path ──────────────────
-    //
+    // ── Compute merkle root ──────────────────────────────────────────────────
     // Block header merkle root uses TXIDs (non-witness hash), not wTXIDs.
-    // For segwit coinbase, sha256d(raw_bytes) would give the wTXID — use txid() instead.
+
     let mut hash: [u8; 32] = coinbase_tx.compute_txid().to_byte_array();
     for sibling in nt.merkle_path.inner_as_ref() {
         let mut data = [0u8; 64];
@@ -116,20 +120,6 @@ async fn mine_block_from_sv2_template() {
         hash = sha256d::Hash::hash(&data).to_byte_array();
     }
     let merkle_root = TxMerkleNode::from_byte_array(hash);
-
-    // ── Fetch matching transactions from RPC ─────────────────────────────────
-    //
-    // sv2-tp and bitcoin-core use the same underlying template, so their
-    // transaction sets should match. If they diverge (race), submit_block will
-    // reject the block with a clear error.
-
-    let rpc_tmpl = client.get_block_template().await.expect("getblocktemplate failed");
-    let mut txdata: Vec<Transaction> = vec![coinbase_tx];
-    for tmpl_tx in &rpc_tmpl.transactions {
-        let raw_bytes = hex::decode(&tmpl_tx.data).expect("tx data is not valid hex");
-        let tx: Transaction = deserialize(&raw_bytes).expect("template tx must be valid");
-        txdata.push(tx);
-    }
 
     // ── Build and mine block header ──────────────────────────────────────────
 
@@ -155,16 +145,23 @@ async fn mine_block_from_sv2_template() {
         }
     }
 
-    // ── Assemble and submit block ────────────────────────────────────────────
-
-    let block = bitcoin::Block { header, txdata };
+    // ── Submit via SubmitSolution → sv2-tp reconstructs and submits block ────
 
     let height_before = client.get_block_count().await.unwrap();
 
-    client
-        .submit_block(&hex::encode(serialize(&block)))
+    solution_tx
+        .send(SubmitSolutionData {
+            template_id: nt.template_id,
+            version: header.version.to_consensus() as u32,
+            header_timestamp: header.time,
+            header_nonce: header.nonce,
+            coinbase_tx: coinbase_bytes,
+        })
         .await
-        .expect("submit_block must succeed");
+        .expect("send SubmitSolution");
+
+    // Give sv2-tp time to reconstruct and submit the block to bitcoin-core.
+    tokio::time::sleep(Duration::from_secs(2)).await;
 
     let height_after = client.get_block_count().await.unwrap();
     assert!(

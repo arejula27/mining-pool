@@ -1,0 +1,16 @@
+# Translator config — generated at runtime by `just start-translator`.
+# AUTHORITY_PUBKEY_PLACEHOLDER is replaced with the base58 x-only public key
+# derived from POOL_AUTHORITY_PUBLIC_KEY in .env.
+
+downstream_address = "0.0.0.0"
+downstream_port = 34255
+max_supported_version = 2
+min_supported_version = 2
+downstream_extranonce2_size = 4
+user_identity = "lottery-pool"
+aggregate_channels = false
+
+[[upstreams]]
+address = "127.0.0.1"
+port = 3333
+authority_pubkey = "AUTHORITY_PUBKEY_PLACEHOLDER"
