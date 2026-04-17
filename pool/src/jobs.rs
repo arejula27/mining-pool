@@ -311,6 +311,81 @@ fn split_at_sv2_extranonce(raw: Vec<u8>) -> CoinbaseParts {
     }
 }
 
+// ── TDP coinbase construction ──────────────────────────────────────────────────
+
+/// Build `coinbase_tx_prefix` / `coinbase_tx_suffix` for `NewExtendedMiningJob`
+/// from the fields of a `template_distribution_sv2::NewTemplate`.
+///
+/// Layout of the assembled coinbase transaction:
+/// ```text
+/// coinbase_tx_prefix
+///     tx_version (4 B LE)  |  varint(1)  |  outpoint (36 B zero)
+///     varint(script_len)   |  coinbase_script_prefix
+/// ── extranonce goes here (SV2_EXTRANONCE_TOTAL bytes) ──
+/// coinbase_tx_suffix
+///     input_sequence (4 B LE)
+///     varint(1 + coinbase_tx_outputs_count)
+///     pool payout output (bitcoin serialization)
+///     coinbase_tx_outputs_bytes  (witness commitment, etc. from sv2-tp)
+///     locktime (4 B LE)
+/// ```
+pub fn build_sv2_coinbase_from_tdp(
+    coinbase_script_prefix: &[u8],
+    coinbase_tx_version: u32,
+    coinbase_tx_input_sequence: u32,
+    coinbase_tx_value_remaining: u64,
+    coinbase_tx_outputs_count: u32,
+    coinbase_tx_outputs_bytes: &[u8],
+    coinbase_tx_locktime: u32,
+    miner_script: ScriptBuf,
+) -> CoinbaseParts {
+    let script_total_len = coinbase_script_prefix.len() + SV2_EXTRANONCE_TOTAL;
+
+    // ── prefix: everything up to (but not including) the extranonce ──
+    let mut prefix = Vec::new();
+    prefix.extend_from_slice(&coinbase_tx_version.to_le_bytes());
+    prefix.push(1u8); // vin count
+    prefix.extend_from_slice(&[0u8; 32]); // prevout hash (all zero = coinbase)
+    prefix.extend_from_slice(&0xffff_ffffu32.to_le_bytes()); // prevout index
+    write_varint(&mut prefix, script_total_len as u64);
+    prefix.extend_from_slice(coinbase_script_prefix);
+
+    // ── suffix: input sequence, outputs, locktime ──
+    let mut suffix = Vec::new();
+    suffix.extend_from_slice(&coinbase_tx_input_sequence.to_le_bytes());
+
+    // output count: 1 (pool payout) + however many sv2-tp added
+    write_varint(&mut suffix, 1 + coinbase_tx_outputs_count as u64);
+
+    // pool payout output serialized with bitcoin crate
+    let payout = TxOut {
+        value: Amount::from_sat(coinbase_tx_value_remaining),
+        script_pubkey: miner_script,
+    };
+    suffix.extend_from_slice(&serialize(&payout));
+
+    // sv2-tp's additional outputs (e.g. witness commitment OP_RETURN)
+    suffix.extend_from_slice(coinbase_tx_outputs_bytes);
+    suffix.extend_from_slice(&coinbase_tx_locktime.to_le_bytes());
+
+    CoinbaseParts { coinb1: prefix, coinb2: suffix }
+}
+
+fn write_varint(buf: &mut Vec<u8>, n: u64) {
+    if n < 0xfd {
+        buf.push(n as u8);
+    } else if n <= 0xffff {
+        buf.push(0xfd);
+        buf.extend_from_slice(&(n as u16).to_le_bytes());
+    } else if n <= 0xffff_ffff {
+        buf.push(0xfe);
+        buf.extend_from_slice(&(n as u32).to_le_bytes());
+    } else {
+        buf.push(0xff);
+        buf.extend_from_slice(&n.to_le_bytes());
+    }
+}
+
 // ── StratumJob assembly ────────────────────────────────────────────────────────
 
 pub fn build_stratum_job(

@@ -1,8 +1,7 @@
 //! Integration tests for the SV2 Mining Protocol server.
 //!
-//! These tests require a running regtest bitcoind.  Start it with `just start`
-//! before running, or use `just int` which starts and stops bitcoind around the
-//! full test suite.
+//! Requires the full environment (bitcoin-node + sv2-tp).
+//! Use `just int` or `just int-tdp` which start and stop everything automatically.
 //!
 //! The tests spin up the SV2 server on a fixed local port (13334) and connect a
 //! minimal in-process Noise initiator to exercise the full handshake + channel
@@ -29,18 +28,23 @@ use tokio::net::TcpStream;
 
 use pool::{
     noise_connection::{connect_noise, NoiseReadHalf},
-    rpc::{RpcClient, TemplatePoller},
     stratum_sv2::{AuthorityKeypair, Sv2Server},
+    template_client,
 };
 
 // Fixed port for SV2 server in tests.  Tests run with --test-threads=1 so no conflicts.
 const SV2_TEST_PORT: u16 = 13334;
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-fn regtest_client() -> RpcClient {
-    RpcClient::new("http://127.0.0.1:18443", "pool", "poolpass")
+fn datadir() -> String {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join(".bitcoin-data")
+        .to_string_lossy()
+        .into_owned()
 }
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
 /// Generate a fresh authority keypair for the test.
 fn generate_keypair() -> ([u8; 32], [u8; 32]) {
@@ -105,16 +109,18 @@ async fn sv2_server_open_extended_channel() {
     let (pub_key, priv_key) = generate_keypair();
     let authority = AuthorityKeypair { public: pub_key, private: priv_key };
 
-    let client = regtest_client();
-    let pool_addr = client
-        .get_new_address()
-        .await
-        .expect("get pool address from regtest");
+    // Any parseable address works; assume_checked() skips network validation.
+    let pool_addr = "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq".to_string();
 
-    let poller = TemplatePoller::start(client)
-        .await
-        .expect("start TemplatePoller");
-    let template_rx = poller.subscribe();
+    let tp_authority_pubkey = template_client::read_authority_pubkey(&datadir())
+        .expect("read sv2_authority_key — run `just start-all` first");
+    let template_rx = template_client::start(
+        "127.0.0.1:18447".parse().unwrap(),
+        tp_authority_pubkey,
+        100,
+    )
+    .await
+    .expect("connect to sv2-tp");
 
     let listen_addr: SocketAddr = format!("127.0.0.1:{SV2_TEST_PORT}").parse().unwrap();
     let server = Sv2Server::new(authority, listen_addr, template_rx, pool_addr);

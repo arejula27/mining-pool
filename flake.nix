@@ -25,6 +25,19 @@
 					sha256 = "sha256-SJwZ8g0zF2WrKDVmHrVG3pD2RGoQeo24MEXnNx5FyuI=";
 				};
 
+				# Bitcoin Core binaries: only bitcoin-cli (RPC client) and bitcoin-node
+				# (IPC-enabled multiprocess daemon). We exclude bitcoind intentionally —
+				# bitcoin-node is a strict superset for our use case.
+				bitcoin-core = pkgs.buildEnv {
+					name = "bitcoin-core-30.2";
+					paths = [];
+					postBuild = ''
+						mkdir -p $out/bin
+						ln -s ${pkgs.bitcoind}/bin/bitcoin-cli $out/bin/bitcoin-cli
+						ln -s ${pkgs.bitcoind}/libexec/bitcoin-node $out/bin/bitcoin-node
+					'';
+				};
+
 				# SV2 Template Provider — pre-built binary from GitHub releases.
 				# Connects to bitcoin-node via IPC and serves the Template Distribution
 				# Protocol to our pool on port 8442.
@@ -72,8 +85,8 @@
 						# Rust
 						rustToolchain.toolchain
 
-						# Bitcoin Core (v30.2) — includes both bitcoind and bitcoin-node
-						pkgs.bitcoind
+						# Bitcoin Core (v30.2) — bitcoin-cli + bitcoin-node (IPC-enabled)
+						bitcoin-core
 
 						# SV2 Template Provider
 						sv2-tp
@@ -93,10 +106,7 @@
 						}
 						export -f bcli
 
-						# bitcoin-node (IPC-enabled multiprocess node) lives in libexec.
-						# Needed by sv2-tp to serve the Template Distribution Protocol.
-						export PATH="${pkgs.bitcoind}/libexec:$PATH"
-					'';
+'';
 				};
 			}
 		);

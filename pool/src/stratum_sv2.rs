@@ -29,16 +29,14 @@ use mining_sv2::{
     MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL, MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL_SUCCESS,
 };
 use noise_sv2::Responder;
+use template_distribution_sv2::NewTemplate;
 use tokio::{net::TcpListener, sync::watch};
 use tracing::{error, info, warn};
 
 use crate::{
-    jobs::{
-        build_merkle_branch, build_sv2_coinbase_parts, script_from_address,
-        witness_commitment_script, SV2_EXTRANONCE2_SIZE,
-    },
+    jobs::{build_sv2_coinbase_from_tdp, script_from_address, SV2_EXTRANONCE2_SIZE},
     noise_connection::{accept_noise, EitherFrame, NoiseWriteHalf},
-    rpc::BlockTemplate,
+    template_client::RawTemplate,
 };
 
 // ── Pool authority keypair ────────────────────────────────────────────────────
@@ -108,7 +106,7 @@ impl ConnectionState {
 pub struct Sv2Server {
     keypair: Arc<AuthorityKeypair>,
     listen_addr: SocketAddr,
-    template_rx: watch::Receiver<BlockTemplate>,
+    template_rx: watch::Receiver<RawTemplate>,
     pool_address: String,
 }
 
@@ -116,7 +114,7 @@ impl Sv2Server {
     pub fn new(
         keypair: AuthorityKeypair,
         listen_addr: SocketAddr,
-        template_rx: watch::Receiver<BlockTemplate>,
+        template_rx: watch::Receiver<RawTemplate>,
         pool_address: String,
     ) -> Self {
         Self {
@@ -160,7 +158,7 @@ async fn handle_connection(
     stream: tokio::net::TcpStream,
     peer_addr: SocketAddr,
     keypair: &AuthorityKeypair,
-    mut template_rx: watch::Receiver<BlockTemplate>,
+    mut template_rx: watch::Receiver<RawTemplate>,
     pool_address: String,
 ) -> Result<()> {
     let responder = keypair.to_responder()?;
@@ -196,8 +194,10 @@ async fn handle_connection(
             }
             Ok(()) = template_rx.changed() => {
                 let template = template_rx.borrow_and_update().clone();
-                info!(%peer_addr, height = template.height, "Template updated, sending new jobs");
-                if let Err(e) = send_jobs_to_all_channels(&mut writer, &state, &template).await {
+                info!(%peer_addr, "Template updated, broadcasting new jobs");
+                let job_id = state.next_job_id;
+                state.next_job_id += 1;
+                if let Err(e) = send_jobs_to_all_channels(&mut writer, &state, &template, job_id).await {
                     error!(%peer_addr, "Error broadcasting jobs: {e:#}");
                 }
             }
@@ -301,7 +301,7 @@ async fn dispatch_message(
     frame: EitherFrame,
     writer: &mut NoiseWriteHalf,
     state: &mut ConnectionState,
-    template: &BlockTemplate,
+    template: &RawTemplate,
     peer_addr: SocketAddr,
 ) -> Result<()> {
     let sv2_frame = match frame {
@@ -332,7 +332,7 @@ async fn handle_open_extended_mining_channel(
     mut frame: Sv2Frame<u32, Vec<u8>>,
     writer: &mut NoiseWriteHalf,
     state: &mut ConnectionState,
-    template: &BlockTemplate,
+    template: &RawTemplate,
     peer_addr: SocketAddr,
 ) -> Result<()> {
     let msg: OpenExtendedMiningChannel<'_> =
@@ -363,7 +363,7 @@ async fn handle_open_extended_mining_channel(
         .expect("prefix_bytes <= 32 bytes, within B032 max");
 
     // Use the network target from the current template as the initial channel target.
-    let target = template_target(template)?;
+    let target = parse_target(template)?;
 
     let success = OpenExtendedMiningChannelSuccess {
         request_id,
@@ -409,15 +409,11 @@ async fn handle_open_extended_mining_channel(
 async fn send_jobs_to_all_channels(
     writer: &mut NoiseWriteHalf,
     state: &ConnectionState,
-    template: &BlockTemplate,
+    template: &RawTemplate,
+    job_id: u32,
 ) -> Result<()> {
     for channel in state.channels.values() {
-        // Note: job_id monotonicity is not strictly required here since we don't
-        // have access to &mut state; we use channel_id XOR template height as a
-        // stable per-template identifier until we refactor state ownership.
-        let job_id = (template.height << 8) | (channel.channel_id & 0xff);
         let (prev_hash, job) = build_job_messages(channel, job_id, template)?;
-
         writer
             .write_sv2_message(prev_hash, MESSAGE_TYPE_MINING_SET_NEW_PREV_HASH, true)
             .await
@@ -432,77 +428,99 @@ async fn send_jobs_to_all_channels(
 
 // ── Job construction ──────────────────────────────────────────────────────────
 
-/// Build `SetNewPrevHash` + `NewExtendedMiningJob` for a single channel.
+/// Build `SetNewPrevHash` + `NewExtendedMiningJob` for a single channel from TDP data.
 fn build_job_messages(
     channel: &ChannelInfo,
     job_id: u32,
-    template: &BlockTemplate,
+    raw: &RawTemplate,
 ) -> Result<(SetNewPrevHash<'static>, NewExtendedMiningJob<'static>)> {
-    // prevhash: getblocktemplate gives display format (reversed). SV2 wants internal byte order.
-    let mut prev_hash_bytes =
-        hex::decode(&template.previousblockhash).context("decode previousblockhash")?;
-    prev_hash_bytes.reverse();
-    let prev_hash = U256::try_from(prev_hash_bytes)
-        .map_err(|e| anyhow::anyhow!("prev_hash conversion: {e:?}"))?;
+    // Deserialize TDP payloads (bytes are cloned so parsed types can borrow from them).
+    let mut nt_bytes = raw.new_template.clone();
+    let mut snph_bytes = raw.set_new_prev_hash.clone();
+    let nt: NewTemplate<'_> = binary_sv2::from_bytes(&mut nt_bytes)
+        .map_err(|e| anyhow::anyhow!("parse NewTemplate: {e:?}"))?;
+    let snph: template_distribution_sv2::SetNewPrevHash<'_> =
+        binary_sv2::from_bytes(&mut snph_bytes)
+            .map_err(|e| anyhow::anyhow!("parse SetNewPrevHash: {e:?}"))?;
 
-    let nbits = u32::from_str_radix(&template.bits, 16)
-        .with_context(|| format!("parse bits: {}", template.bits))?;
+    // Extract everything we need before the temp vecs go out of scope.
+    let coinbase_script_prefix = nt.coinbase_prefix.inner_as_ref().to_vec();
+    let coinbase_tx_version = nt.coinbase_tx_version;
+    let coinbase_tx_input_sequence = nt.coinbase_tx_input_sequence;
+    let coinbase_tx_value_remaining = nt.coinbase_tx_value_remaining;
+    let coinbase_tx_outputs_count = nt.coinbase_tx_outputs_count;
+    let coinbase_tx_outputs_bytes = nt.coinbase_tx_outputs.inner_as_ref().to_vec();
+    let coinbase_tx_locktime = nt.coinbase_tx_locktime;
+    let version = nt.version;
 
-    let set_prev_hash = SetNewPrevHash {
+    // Seq0255<U256<'_>>.inner_as_ref() → Vec<&[u8]>, one slice per 32-byte hash.
+    let path_hashes: Vec<U256<'static>> = nt
+        .merkle_path
+        .inner_as_ref()
+        .into_iter()
+        .map(|bytes| {
+            let mut h = [0u8; 32];
+            h.copy_from_slice(bytes);
+            U256::from(h)
+        })
+        .collect();
+
+    let prev_hash = U256::try_from(snph.prev_hash.inner_as_ref().to_vec())
+        .map_err(|e| anyhow::anyhow!("prev_hash: {e:?}"))?;
+    let header_timestamp = snph.header_timestamp;
+    let nbits = snph.n_bits;
+
+    // Build per-channel coinbase from TDP data.
+    let miner_script = script_from_address(&channel.miner_address)
+        .with_context(|| format!("invalid miner address: {}", channel.miner_address))?;
+    let parts = build_sv2_coinbase_from_tdp(
+        &coinbase_script_prefix,
+        coinbase_tx_version,
+        coinbase_tx_input_sequence,
+        coinbase_tx_value_remaining,
+        coinbase_tx_outputs_count,
+        &coinbase_tx_outputs_bytes,
+        coinbase_tx_locktime,
+        miner_script,
+    );
+
+    let coinbase_tx_prefix =
+        B064K::try_from(parts.coinb1).map_err(|e| anyhow::anyhow!("coinbase prefix: {e:?}"))?;
+    let coinbase_tx_suffix =
+        B064K::try_from(parts.coinb2).map_err(|e| anyhow::anyhow!("coinbase suffix: {e:?}"))?;
+    let merkle_path =
+        Seq0255::new(path_hashes).map_err(|e| anyhow::anyhow!("merkle path: {e:?}"))?;
+
+    let mining_snph = SetNewPrevHash {
         channel_id: channel.channel_id,
         job_id,
         prev_hash,
-        min_ntime: template.curtime,
+        min_ntime: header_timestamp,
         nbits,
     };
-
-    // Build per-channel coinbase using the miner's address.
-    let miner_script = script_from_address(&channel.miner_address)
-        .with_context(|| format!("invalid miner address: {}", channel.miner_address))?;
-    let wc_script = template
-        .default_witness_commitment
-        .as_deref()
-        .map(witness_commitment_script);
-
-    let parts = build_sv2_coinbase_parts(
-        template.height,
-        template.coinbasevalue,
-        miner_script,
-        wc_script,
-    );
-
-    let coinbase_tx_prefix = B064K::try_from(parts.coinb1)
-        .map_err(|e| anyhow::anyhow!("coinb1 too large: {e:?}"))?;
-    let coinbase_tx_suffix = B064K::try_from(parts.coinb2)
-        .map_err(|e| anyhow::anyhow!("coinb2 too large: {e:?}"))?;
-
-    // Merkle path: branch hashes as U256 values.
-    let branch = build_merkle_branch(&template.transactions);
-    let path_hashes: Vec<U256<'static>> = branch
-        .into_iter()
-        .map(U256::from)
-        .collect();
-    let merkle_path =
-        Seq0255::new(path_hashes).map_err(|e| anyhow::anyhow!("merkle path: {e:?}"))?;
 
     let job = NewExtendedMiningJob {
         channel_id: channel.channel_id,
         job_id,
-        min_ntime: Sv2Option::new(Some(template.curtime)),
-        version: template.version,
+        min_ntime: Sv2Option::new(Some(header_timestamp)),
+        version,
         version_rolling_allowed: true,
         merkle_path,
         coinbase_tx_prefix,
         coinbase_tx_suffix,
     };
 
-    Ok((set_prev_hash, job))
+    Ok((mining_snph, job))
 }
 
-/// Parse the network target from the template's hex `target` field into a U256.
-fn template_target(template: &BlockTemplate) -> Result<U256<'static>> {
-    let bytes = hex::decode(&template.target).context("decode target")?;
-    U256::try_from(bytes).map_err(|e| anyhow::anyhow!("target conversion: {e:?}"))
+/// Extract the channel target from the TDP SetNewPrevHash payload.
+fn parse_target(raw: &RawTemplate) -> Result<U256<'static>> {
+    let mut snph_bytes = raw.set_new_prev_hash.clone();
+    let snph: template_distribution_sv2::SetNewPrevHash<'_> =
+        binary_sv2::from_bytes(&mut snph_bytes)
+            .map_err(|e| anyhow::anyhow!("parse SetNewPrevHash for target: {e:?}"))?;
+    let bytes = snph.target.inner_as_ref().to_vec();
+    U256::try_from(bytes).map_err(|e| anyhow::anyhow!("target: {e:?}"))
 }
 
 /// Try to extract a Bitcoin address from a Stratum user_identity string.
