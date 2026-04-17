@@ -89,17 +89,19 @@
 						hash = "sha256-kREY8TQ8t5CA8MT/h4ncsMd7w9tv6BnYyfU8jFv3r1A=";
 					};
 
+					# Extract into a subdirectory and set sourceRoot so nix cds into it.
 					unpackPhase = ''
 						runHook preUnpack
 						mkdir unpacked
 						tar -xzf "$src" -C unpacked
+						sourceRoot="unpacked/translator"
 						runHook postUnpack
 					'';
 
 					installPhase = ''
 						runHook preInstall
 						mkdir -p "$out/bin"
-						cp unpacked/translator/translator_sv2 "$out/bin/translator_sv2"
+						cp translator_sv2 "$out/bin/translator_sv2"
 						runHook postInstall
 					'';
 
