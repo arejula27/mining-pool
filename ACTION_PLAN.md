@@ -85,19 +85,21 @@ Key design: use **extended channels** (not standard) — the official translator
 - [ ] Inactive channel timeout (configurable, default 10 min)
 
 ## Paso 4d — Integrar y configurar el translator
-- [ ] Añadir el binario `translator` de sv2-apps al `flake.nix`
-- [ ] Escribir `translator.toml`: upstream apunta a nuestro puerto SV2, downstream expone puerto SV1
-- [ ] Añadir receta `just translator` para arrancarlo, tambien añadirlo al test de integracion 
-- [ ] Verificar handshake SV1 completo (subscribe + authorize + notify) a través del translator
+- [x] Añadir el binario `translator` de sv2-apps al `flake.nix`
+- [x] Escribir `translator.toml`: upstream apunta a nuestro puerto SV2, downstream expone puerto SV1
+- [x] Añadir receta `just translator` para arrancarlo, tambien añadirlo al test de integracion 
+- [x] Verificar handshake SV1 completo (subscribe + authorize + notify) a través del translator
+- [x] Write `pool/tests/sv1_miner.rs`: SV1 client → translator → pool → sv2-tp → bitcoin-core e2e test
 
 ## Paso 5 — Validación de shares
 Using extended channels, miners (via translator) send `SubmitSharesExtended`.
-- [ ] Recibir `SubmitSharesExtended` (channel_id, sequence_number, job_id, nonce, ntime, version, extranonce)
-- [ ] Look up the job by channel_id + job_id; reconstruct coinbase using channel's coinbase_prefix + extranonce + coinbase_suffix
-- [ ] Compute coinbase hash → merkle root (applying stored merkle_path) → block header hash
-- [ ] Verify hash meets share difficulty for the channel
-- [ ] Si cumple dificultad de red → serializar bloque completo y enviarlo a Core vía `submitblock` (RPC); enviar `SubmitSolution` al template provider
-- [ ] Responder `SubmitSharesSuccess` / `SubmitSharesError` con el sequence_number correcto
+- [x] Recibir `SubmitSharesExtended` (channel_id, sequence_number, job_id, nonce, ntime, version, extranonce)
+- [x] Look up the job by channel_id + job_id; reconstruct coinbase using channel's coinbase_prefix + extranonce + coinbase_suffix
+- [x] Compute coinbase hash → merkle root (applying stored merkle_path) → block header hash
+- [x] Si cumple dificultad de red → enviar `SubmitSolution` al template provider
+- [x] Responder `SubmitSharesSuccess` con el sequence_number correcto
+- [ ] Per-channel difficulty target (currently all shares accepted; only block-level checked)
+- [ ] `SubmitSharesError` response on stale/unknown job
 
 ## Paso 6 — Persistencia básica
 - [ ] SQLite con sqlx

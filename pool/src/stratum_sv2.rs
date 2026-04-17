@@ -67,6 +67,7 @@ impl AuthorityKeypair {
 // ── Per-connection state ──────────────────────────────────────────────────────
 
 /// All data needed to validate a share for a specific job.
+#[allow(dead_code)]
 struct JobInfo {
     job_id: u32,
     template_id: u64,
