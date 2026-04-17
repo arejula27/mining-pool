@@ -36,8 +36,8 @@ Bitaxe/NerdAxe  (SV1)
 - [x] Parsear la respuesta: transacciones, prevhash, bits, height, coinbasevalue
 - [x] Poll de nuevos bloques (detectar cuando llega bloque nuevo → `clearJobs`)
 
-> Este módulo se sustituirá en Paso 4b por el Template Distribution Protocol.
-> Hasta entonces sirve como fuente de templates durante el desarrollo.
+> `TemplatePoller` ya fue eliminado en Paso 4b. `RpcClient` se mantiene para tests
+> de integración (generatetoaddress, submitblock, etc.) y para el futuro Paso 5.
 
 ## Paso 3 — Constructor de jobs
 - [x] Construir la transacción coinbase con la dirección del miner
@@ -58,14 +58,17 @@ El servidor SV1 que escribimos en `stratum.rs` lo reemplaza el translator de sv2
 ## Paso 4b — Cliente de Template Distribution Protocol
 Reemplaza el RPC poller (`rpc::TemplatePoller`) con una conexión real al Template Provider.
 Crates ya en `Cargo.toml`: `template_distribution_sv2 = "5.0.0"`. Añadir: `stratum-apps = "0.3.0"` (feature `network_helpers`) para `NoiseTcpStream` / `accept_noise_connection`.
-- [ ] New module `pool/src/template_client.rs`
-- [ ] TCP client that connects to `bitcoin-core-sv2` (configurable address, default port 8442)
-- [ ] Noise **initiator** handshake toward the template provider (opposite role to Paso 4c)
-- [ ] Send `SetupConnection` (protocol = Template Distribution, flags = 0)
-- [ ] Receive `NewTemplate` + `SetNewPrevHash`; broadcast via `tokio::sync::watch` channel (same interface as current `TemplatePoller`)
-- [ ] Send `SubmitSolution` to the template provider when a block is found
-- [ ] Add `bitcoin-core-sv2` binary to `flake.nix` and `just` recipe to launch it
-- [ ] Write `config/bitcoin-core-sv2.toml` (RPC connection to bitcoind, listen port 8442)
+- [x] New module `pool/src/template_client.rs`
+- [x] TCP client that connects to sv2-tp (configurable address, default port 18447 on regtest)
+- [x] Noise **initiator** handshake toward the template provider (reads authority pubkey from `sv2_authority_key` file in bitcoind datadir)
+- [x] Send `SetupConnection` + `CoinbaseOutputConstraints`; receive `NewTemplate` + `SetNewPrevHash`
+- [x] Broadcast via `tokio::sync::watch<RawTemplate>` channel; replaces `TemplatePoller`
+- [x] Remove `TemplatePoller` and dead SV1 code (`StratumJob`, `build_stratum_job`) from codebase
+- [x] Add `sv2-tp` binary to `flake.nix`; `just start-all` / `just stop-all` recipes
+- [x] Write `bitcoin/sv2-tp.conf`; integration test `tests/template_client.rs`
+- [ ] Fix `build_sv2_coinbase_from_tdp` for segwit: add `use_segwit: bool` param (true when `coinbase_tx_outputs_count > 0`); insert marker/flag bytes in prefix; append 32-byte witness nonce before locktime in suffix
+- [ ] Write `pool/tests/mine_block.rs`: receive `RawTemplate` from sv2-tp → build segwit coinbase → brute-force nonce → submit via RPC → assert block height increased
+- [ ] Send `SubmitSolution` to sv2-tp when a block is found (Paso 5)
 
 ## Paso 4c — Servidor SV2 Mining Protocol
 La pool habla SV2 Extended Channel con el translator. Los Bitaxes se conectan al translator.
@@ -84,7 +87,7 @@ Key design: use **extended channels** (not standard) — the official translator
 ## Paso 4d — Integrar y configurar el translator
 - [ ] Añadir el binario `translator` de sv2-apps al `flake.nix`
 - [ ] Escribir `translator.toml`: upstream apunta a nuestro puerto SV2, downstream expone puerto SV1
-- [ ] Añadir receta `just translator` para arrancarlo
+- [ ] Añadir receta `just translator` para arrancarlo, tambien añadirlo al test de integracion 
 - [ ] Verificar handshake SV1 completo (subscribe + authorize + notify) a través del translator
 
 ## Paso 5 — Validación de shares

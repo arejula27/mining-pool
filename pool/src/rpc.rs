@@ -1,21 +1,11 @@
-use std::time::Duration;
-
 use anyhow::{bail, Context, Result};
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tokio::sync::watch;
-use tracing::{info, warn};
-
-// Bitcoin Core holds long-poll requests for up to ~90 s; give it some headroom.
-const LONGPOLL_TIMEOUT: Duration = Duration::from_secs(120);
-// Retry delay after a failed poll before trying again.
-const POLL_RETRY_DELAY: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone)]
 pub struct RpcClient {
     client: Client,
-    longpoll_client: Client,
     url: String,
     user: String,
     pass: String,
@@ -25,10 +15,6 @@ impl RpcClient {
     pub fn new(url: &str, user: &str, pass: &str) -> Self {
         RpcClient {
             client: Client::new(),
-            longpoll_client: Client::builder()
-                .timeout(LONGPOLL_TIMEOUT)
-                .build()
-                .expect("failed to build long-poll HTTP client"),
             url: url.to_string(),
             user: user.to_string(),
             pass: pass.to_string(),
@@ -37,10 +23,6 @@ impl RpcClient {
 
     async fn call(&self, method: &str, params: Value) -> Result<Value> {
         self.do_call(&self.client, method, params).await
-    }
-
-    async fn call_longpoll(&self, method: &str, params: Value) -> Result<Value> {
-        self.do_call(&self.longpoll_client, method, params).await
     }
 
     async fn do_call(&self, client: &Client, method: &str, params: Value) -> Result<Value> {
@@ -75,17 +57,6 @@ impl RpcClient {
         let result = self.call("getblocktemplate", params).await?;
         let tmpl: BlockTemplate =
             serde_json::from_value(result).context("Failed to parse BlockTemplate")?;
-        tmpl.assert_invariants();
-        Ok(tmpl)
-    }
-
-    /// Blocks until Bitcoin Core has a new template to offer (new block or
-    /// significant mempool change), then returns it.
-    async fn get_block_template_longpoll(&self, longpollid: &str) -> Result<BlockTemplate> {
-        let params = json!([{ "rules": ["segwit"], "longpollid": longpollid }]);
-        let result = self.call_longpoll("getblocktemplate", params).await?;
-        let tmpl: BlockTemplate =
-            serde_json::from_value(result).context("Failed to parse BlockTemplate (longpoll)")?;
         tmpl.assert_invariants();
         Ok(tmpl)
     }
@@ -142,57 +113,6 @@ impl RpcClient {
             .and_then(|v| v.as_u64())
             .map(|n| n as u32)
             .context("getblockchaininfo missing 'blocks' field")
-    }
-}
-
-// ── Template poller ────────────────────────────────────────────────────────────
-
-/// Watches Bitcoin Core for new block templates using long-polling.
-///
-/// Callers subscribe via [`TemplatePoller::subscribe`] and receive a
-/// `watch::Receiver<BlockTemplate>` that is updated whenever a new block
-/// arrives (i.e. whenever miners should receive a `clearJobs = true` notify).
-pub struct TemplatePoller {
-    receiver: watch::Receiver<BlockTemplate>,
-}
-
-impl TemplatePoller {
-    /// Fetches the first template and spawns a background task that keeps it
-    /// up to date.  Returns an error only if the initial fetch fails.
-    pub async fn start(client: RpcClient) -> Result<Self> {
-        let initial = client.get_block_template().await?;
-        info!(height = initial.height, "Initial block template fetched");
-
-        let (tx, rx) = watch::channel(initial);
-
-        tokio::spawn(poll_loop(client, tx));
-
-        Ok(Self { receiver: rx })
-    }
-
-    /// Returns a new receiver that always holds the latest template.
-    pub fn subscribe(&self) -> watch::Receiver<BlockTemplate> {
-        self.receiver.clone()
-    }
-}
-
-async fn poll_loop(client: RpcClient, tx: watch::Sender<BlockTemplate>) {
-    loop {
-        let longpollid = tx.borrow().longpollid.clone();
-
-        match client.get_block_template_longpoll(&longpollid).await {
-            Ok(tmpl) => {
-                info!(height = tmpl.height, "New block template (long-poll)");
-                // If all receivers have been dropped the pool is shutting down.
-                if tx.send(tmpl).is_err() {
-                    break;
-                }
-            }
-            Err(e) => {
-                warn!("Long-poll failed, retrying in {}s: {e}", POLL_RETRY_DELAY.as_secs());
-                tokio::time::sleep(POLL_RETRY_DELAY).await;
-            }
-        }
     }
 }
 

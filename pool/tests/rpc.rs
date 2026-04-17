@@ -1,6 +1,4 @@
-use std::time::Duration;
-
-use pool::rpc::{RpcClient, TemplatePoller};
+use pool::rpc::RpcClient;
 
 fn regtest_client() -> RpcClient {
     RpcClient::new(
@@ -81,27 +79,4 @@ async fn block_template_transaction_fields_are_valid() {
         assert!(tx.fee >= 0, "fee must be non-negative");
         assert!(tx.weight > 0, "weight must be positive");
     }
-}
-
-#[tokio::test]
-async fn template_poller_updates_on_new_block() {
-    let client = regtest_client();
-    let poller = TemplatePoller::start(client.clone()).await.expect("poller failed to start");
-    let mut rx = poller.subscribe();
-
-    let height_before = rx.borrow().height;
-
-    // Mine one block to trigger a new template.
-    let addr = client.get_new_address().await.expect("getnewaddress failed");
-    client.generate_to_address(1, &addr).await.expect("generatetoaddress failed");
-
-    // Wait for the poller to deliver the updated template (long-poll timeout is 120s,
-    // but on regtest a new block triggers it immediately).
-    tokio::time::timeout(Duration::from_secs(10), rx.changed())
-        .await
-        .expect("timed out waiting for template update")
-        .expect("watch channel closed");
-
-    let height_after = rx.borrow().height;
-    assert!(height_after > height_before, "height must increase (before={height_before}, after={height_after})");
 }

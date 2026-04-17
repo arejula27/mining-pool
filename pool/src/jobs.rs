@@ -27,7 +27,7 @@ use bitcoin::{
 };
 use std::str::FromStr;
 
-use crate::rpc::{BlockTemplate, TemplateTransaction};
+use crate::rpc::TemplateTransaction;
 
 // ── Constants ──────────────────────────────────────────────────────────────────
 
@@ -50,25 +50,6 @@ const EXTRANONCE_PLACEHOLDER: [u8; EXTRANONCE1_SIZE + EXTRANONCE2_SIZE] =
 pub struct CoinbaseParts {
     pub coinb1: Vec<u8>,
     pub coinb2: Vec<u8>,
-}
-
-/// A job ready to be sent to a miner via `mining.notify`.
-#[derive(Debug, Clone)]
-pub struct StratumJob {
-    pub job_id: String,
-    /// Previous block hash: full 32-byte reversal of the RPC display format.
-    pub prevhash: String,
-    pub coinb1: String,
-    pub coinb2: String,
-    /// Sibling hashes at each merkle level, as lowercase hex.
-    pub merkle_branch: Vec<String>,
-    /// Block version as big-endian hex (8 chars).
-    pub version: String,
-    /// Compact target bits as big-endian hex (8 chars).
-    pub nbits: String,
-    /// Current time as big-endian hex (8 chars).
-    pub ntime: String,
-    pub clean_jobs: bool,
 }
 
 // ── Coinbase construction ──────────────────────────────────────────────────────
@@ -384,52 +365,6 @@ fn write_varint(buf: &mut Vec<u8>, n: u64) {
         buf.push(0xff);
         buf.extend_from_slice(&n.to_le_bytes());
     }
-}
-
-// ── StratumJob assembly ────────────────────────────────────────────────────────
-
-pub fn build_stratum_job(
-    template: &BlockTemplate,
-    miner_address: &str,
-    job_id: &str,
-    clean_jobs: bool,
-) -> Result<StratumJob> {
-    let miner_script = script_from_address(miner_address)?;
-    let wc_script = template
-        .default_witness_commitment
-        .as_deref()
-        .map(witness_commitment_script);
-
-    let parts = build_coinbase_parts(
-        template.height,
-        template.coinbasevalue,
-        miner_script,
-        wc_script,
-    );
-
-    let branch = build_merkle_branch(&template.transactions);
-
-    // Stratum V1 prevhash: split the display-format hash into 4-byte words and
-    // reverse the bytes within each word (little-endian 32-bit groups).
-    // This differs from a full 32-byte reversal (which gives internal byte order).
-    let mut prevhash_bytes = hex::decode(&template.previousblockhash)
-        .expect("previousblockhash is not valid hex");
-    for chunk in prevhash_bytes.chunks_mut(4) {
-        chunk.reverse();
-    }
-    let prevhash = hex::encode(&prevhash_bytes);
-
-    Ok(StratumJob {
-        job_id: job_id.to_string(),
-        prevhash,
-        coinb1: hex::encode(&parts.coinb1),
-        coinb2: hex::encode(&parts.coinb2),
-        merkle_branch: branch.iter().map(hex::encode).collect(),
-        version: format!("{:08x}", template.version),
-        nbits: template.bits.clone(),
-        ntime: format!("{:08x}", template.curtime),
-        clean_jobs,
-    })
 }
 
 // ── Unit tests ─────────────────────────────────────────────────────────────────
