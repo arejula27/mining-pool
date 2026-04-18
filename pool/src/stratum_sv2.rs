@@ -8,8 +8,8 @@
 //!   - Noise handshake (responder)
 //!   - `SetupConnection` → `SetupConnectionSuccess`
 //!   - `OpenExtendedMiningChannel` → `OpenExtendedMiningChannelSuccess`
-//!     + `SetNewPrevHash` + `NewExtendedMiningJob`
-//!   - Template-change broadcast: sends new `SetNewPrevHash` + `NewExtendedMiningJob`
+//!     + `NewExtendedMiningJob` + `SetNewPrevHash` (job must arrive first)
+//!   - Template-change broadcast: sends new `NewExtendedMiningJob` + `SetNewPrevHash`
 //!     to all open channels when the block template changes
 
 use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
@@ -30,10 +30,11 @@ use common_messages_sv2::{
 use framing_sv2::framing::{Frame, Sv2Frame};
 use mining_sv2::{
     NewExtendedMiningJob, OpenExtendedMiningChannel, OpenExtendedMiningChannelSuccess,
-    SetNewPrevHash, SubmitSharesExtended, SubmitSharesSuccess,
+    SetNewPrevHash, SubmitSharesError, SubmitSharesExtended, SubmitSharesSuccess,
     MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB, MESSAGE_TYPE_MINING_SET_NEW_PREV_HASH,
     MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL, MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL_SUCCESS,
-    MESSAGE_TYPE_SUBMIT_SHARES_EXTENDED, MESSAGE_TYPE_SUBMIT_SHARES_SUCCESS,
+    MESSAGE_TYPE_SUBMIT_SHARES_ERROR, MESSAGE_TYPE_SUBMIT_SHARES_EXTENDED,
+    MESSAGE_TYPE_SUBMIT_SHARES_SUCCESS,
 };
 use noise_sv2::Responder;
 use template_distribution_sv2::NewTemplate;
@@ -89,6 +90,8 @@ struct ChannelInfo {
     miner_address: String,
     /// Most recent job sent to this channel.
     current_job: Option<JobInfo>,
+    /// Per-channel share target (big-endian, for internal comparison against block hash).
+    channel_target_be: [u8; 32],
 }
 
 /// Mutable state for one TCP connection (multiple channels can be multiplexed).
@@ -372,6 +375,7 @@ async fn handle_open_extended_mining_channel(
 
     let request_id = msg.request_id;
     let user_identity = msg.user_identity.as_utf8_or_hex().to_string();
+    let nominal_hash_rate = msg.nominal_hash_rate;
 
     // Extract miner BTC address from user_identity (e.g. "bc1q....worker1" or just the address).
     let miner_address = parse_miner_address(&user_identity, &state.pool_address);
@@ -379,11 +383,25 @@ async fn handle_open_extended_mining_channel(
     let channel_id = state.alloc_channel_id();
     let extranonce1 = channel_id.to_le_bytes();
 
+    // Compute per-channel share target from the miner's declared hashrate,
+    // clamped so it is never harder than the current network target.
+    let mut channel_target_be = hashrate_to_target_be(nominal_hash_rate);
+    let mut snph_bytes = template.set_new_prev_hash.clone();
+    if let Ok(snph) = binary_sv2::from_bytes::<template_distribution_sv2::SetNewPrevHash<'_>>(&mut snph_bytes) {
+        let network_target_be = compact_to_target_be(snph.n_bits);
+        // A larger target means easier; use max so we never reject block-winning shares.
+        if network_target_be > channel_target_be {
+            channel_target_be = network_target_be;
+        }
+    }
+    let channel_target_sv2 = target_be_to_sv2(&channel_target_be)?;
+
     info!(
         %peer_addr,
         channel_id,
         user_identity = %user_identity,
         miner_address = %miner_address,
+        nominal_hash_rate,
         "OpenExtendedMiningChannel"
     );
 
@@ -393,13 +411,10 @@ async fn handle_open_extended_mining_channel(
     let extranonce_prefix: B032<'static> = B032::try_from(prefix_bytes.to_vec())
         .expect("prefix_bytes <= 32 bytes, within B032 max");
 
-    // Use the network target from the current template as the initial channel target.
-    let target = parse_target(template)?;
-
     let success = OpenExtendedMiningChannelSuccess {
         request_id,
         channel_id,
-        target,
+        target: channel_target_sv2,
         extranonce_size: SV2_EXTRANONCE2_SIZE as u16,
         extranonce_prefix,
         group_channel_id: 0,
@@ -413,7 +428,7 @@ async fn handle_open_extended_mining_channel(
     info!(%peer_addr, channel_id, "OpenExtendedMiningChannelSuccess sent");
 
     // Register the channel.
-    let channel = ChannelInfo { channel_id, extranonce1, miner_address, current_job: None };
+    let channel = ChannelInfo { channel_id, extranonce1, miner_address, current_job: None, channel_target_be };
     state.channels.insert(channel_id, channel);
 
     // Send the first job immediately.
@@ -423,13 +438,13 @@ async fn handle_open_extended_mining_channel(
     state.channels.get_mut(&channel_id).unwrap().current_job = Some(job_info);
 
     writer
-        .write_sv2_message(prev_hash, MESSAGE_TYPE_MINING_SET_NEW_PREV_HASH, true)
-        .await
-        .context("send SetNewPrevHash")?;
-    writer
         .write_sv2_message(job, MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB, true)
         .await
         .context("send NewExtendedMiningJob")?;
+    writer
+        .write_sv2_message(prev_hash, MESSAGE_TYPE_MINING_SET_NEW_PREV_HASH, true)
+        .await
+        .context("send SetNewPrevHash")?;
 
     info!(%peer_addr, channel_id, job_id, "Initial job sent");
     Ok(())
@@ -450,13 +465,13 @@ async fn send_jobs_to_all_channels(
         let (prev_hash, job, job_info) = build_job_messages(channel, job_id, template)?;
         state.channels.get_mut(&channel_id).unwrap().current_job = Some(job_info);
         writer
-            .write_sv2_message(prev_hash, MESSAGE_TYPE_MINING_SET_NEW_PREV_HASH, true)
-            .await
-            .context("send SetNewPrevHash on template update")?;
-        writer
             .write_sv2_message(job, MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB, true)
             .await
             .context("send NewExtendedMiningJob on template update")?;
+        writer
+            .write_sv2_message(prev_hash, MESSAGE_TYPE_MINING_SET_NEW_PREV_HASH, true)
+            .await
+            .context("send SetNewPrevHash on template update")?;
     }
     Ok(())
 }
@@ -548,7 +563,7 @@ fn build_job_messages(
     let job = NewExtendedMiningJob {
         channel_id: channel.channel_id,
         job_id,
-        min_ntime: Sv2Option::new(Some(header_timestamp)),
+        min_ntime: Sv2Option::new(None), // future job; activated by the paired SetNewPrevHash
         version,
         version_rolling_allowed: true,
         merkle_path,
@@ -610,9 +625,14 @@ async fn handle_submit_shares_extended(
         Some(j) => j,
         None => {
             warn!(%peer_addr, channel_id, "SubmitSharesExtended: no current job");
-            return Ok(());
+            return send_shares_error(writer, channel_id, sequence_number, "stale-share-before-activation").await;
         }
     };
+
+    if job.job_id != share.job_id {
+        warn!(%peer_addr, channel_id, job_id = share.job_id, current = job.job_id, "stale job_id");
+        return send_shares_error(writer, channel_id, sequence_number, "stale-share-before-activation").await;
+    }
 
     // Reconstruct coinbase: coinb1 + extranonce_prefix(32) + extranonce2(4) + coinb2
     let mut full_extranonce = [0u8; SV2_EXTRANONCE_TOTAL];
@@ -652,10 +672,18 @@ async fn handle_submit_shares_extended(
     };
 
     let block_hash = header.block_hash().to_string();
-    let target_hex = compact_to_target_hex(job.nbits);
+    let channel_target_hex = hex::encode(channel.channel_target_be);
+    let network_target_hex = compact_to_target_hex(job.nbits);
 
-    if block_hash <= target_hex {
-        info!(%peer_addr, channel_id, "Block-level share found! Sending SubmitSolution");
+    // Reject shares that don't meet the per-channel difficulty.
+    if block_hash > channel_target_hex {
+        info!(%peer_addr, channel_id, "Share below channel difficulty — rejected");
+        return send_shares_error(writer, channel_id, sequence_number, "difficulty-too-low").await;
+    }
+
+    // Block-level solution: propagate to sv2-tp.
+    if block_hash <= network_target_hex {
+        info!(%peer_addr, channel_id, "Block-level share! Sending SubmitSolution");
         let _ = solution_tx.send(SubmitSolutionData {
             template_id: job.template_id,
             version: share.version,
@@ -665,7 +693,6 @@ async fn handle_submit_shares_extended(
         }).await;
     }
 
-    // Accept every share (no per-share difficulty filter yet).
     let success = SubmitSharesSuccess {
         channel_id,
         last_sequence_number: sequence_number,
@@ -678,6 +705,36 @@ async fn handle_submit_shares_extended(
         .context("send SubmitSharesSuccess")?;
 
     Ok(())
+}
+
+async fn send_shares_error(
+    writer: &mut NoiseWriteHalf,
+    channel_id: u32,
+    sequence_number: u32,
+    error_code: &str,
+) -> Result<()> {
+    use binary_sv2::Str0255;
+    let code = Str0255::try_from(error_code.as_bytes().to_vec())
+        .unwrap_or_else(|_| Str0255::try_from(b"unknown-error".to_vec()).expect("valid Str0255"));
+    let err = SubmitSharesError { channel_id, sequence_number, error_code: code };
+    writer
+        .write_sv2_message(err, MESSAGE_TYPE_SUBMIT_SHARES_ERROR, true)
+        .await
+        .context("send SubmitSharesError")
+}
+
+/// Convert compact bits to a 32-byte big-endian target.
+fn compact_to_target_be(bits: u32) -> [u8; 32] {
+    let exp = (bits >> 24) as usize;
+    let mantissa = bits & 0x007f_ffff;
+    let mut be = [0u8; 32];
+    if exp >= 3 && exp <= 32 {
+        let i = 32 - exp;
+        if i < 32     { be[i]   = ((mantissa >> 16) & 0xff) as u8; }
+        if i + 1 < 32 { be[i+1] = ((mantissa >> 8)  & 0xff) as u8; }
+        if i + 2 < 32 { be[i+2] = (mantissa          & 0xff) as u8; }
+    }
+    be
 }
 
 /// Convert compact bits to a 32-byte big-endian target as a lowercase hex string.
@@ -694,15 +751,6 @@ fn compact_to_target_hex(bits: u32) -> String {
     hex::encode(be)
 }
 
-/// Extract the channel target from the TDP SetNewPrevHash payload.
-fn parse_target(raw: &RawTemplate) -> Result<U256<'static>> {
-    let mut snph_bytes = raw.set_new_prev_hash.clone();
-    let snph: template_distribution_sv2::SetNewPrevHash<'_> =
-        binary_sv2::from_bytes(&mut snph_bytes)
-            .map_err(|e| anyhow::anyhow!("parse SetNewPrevHash for target: {e:?}"))?;
-    let bytes = snph.target.inner_as_ref().to_vec();
-    U256::try_from(bytes).map_err(|e| anyhow::anyhow!("target: {e:?}"))
-}
 
 /// Try to extract a Bitcoin address from a Stratum user_identity string.
 ///
@@ -721,6 +769,47 @@ fn parse_miner_address(user_identity: &str, pool_address: &str) -> String {
         );
         pool_address.to_string()
     }
+}
+
+// ── Per-channel difficulty ────────────────────────────────────────────────────
+
+/// Target share interval: aim for one share every this many seconds per channel.
+const SHARE_INTERVAL_SECS: f64 = 30.0;
+
+/// Compute a per-channel share target (big-endian 32 bytes) that gives roughly
+/// one share every `SHARE_INTERVAL_SECS` seconds for a miner at `hashrate` H/s.
+///
+/// Uses Bitcoin's difficulty-1 reference target:
+///   pdiff1 = 0x00000000_FFFF0000_00000000_..._00000000  (big-endian)
+///
+/// channel_target = pdiff1 / max(1, hashrate * interval / 2^32)
+///
+/// A higher target value means easier (more shares accepted).
+pub fn hashrate_to_target_be(hashrate_hps: f32) -> [u8; 32] {
+    let expected_hashes = hashrate_hps as f64 * SHARE_INTERVAL_SECS;
+    // Bitcoin difficulty-1 unit: 2^32 hashes expected at diff 1.
+    let difficulty = (expected_hashes / (1u64 << 32) as f64).max(1.0) as u128;
+
+    // pdiff1 target in big-endian.
+    let mut target = [0u8; 32];
+    target[4] = 0xff;
+    target[5] = 0xff;
+
+    // Long-division of the 32-byte big-endian number by difficulty.
+    let mut carry = 0u128;
+    for b in target.iter_mut() {
+        let val = carry * 256 + *b as u128;
+        *b = (val / difficulty) as u8;
+        carry = val % difficulty;
+    }
+    target
+}
+
+/// Convert a big-endian 32-byte target to a little-endian `U256` for SV2 wire format.
+fn target_be_to_sv2(target_be: &[u8; 32]) -> Result<U256<'static>> {
+    let mut le = *target_be;
+    le.reverse();
+    U256::try_from(le.to_vec()).map_err(|e| anyhow::anyhow!("target_be_to_sv2: {e:?}"))
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────
@@ -805,6 +894,33 @@ mod tests {
         assert_eq!(bytes.len(), 6);
         assert_eq!(u16::from_le_bytes([bytes[0], bytes[1]]), 2);
         assert_eq!(u32::from_le_bytes([bytes[2], bytes[3], bytes[4], bytes[5]]), 0x02);
+    }
+
+    #[test]
+    fn hashrate_target_difficulty_one() {
+        // Very low hashrate → difficulty clamped to 1 → target = pdiff1.
+        let t = hashrate_to_target_be(1.0);
+        assert_eq!(t[0], 0x00);
+        assert_eq!(t[4], 0xff);
+        assert_eq!(t[5], 0xff);
+        // All bytes after index 5 must be zero.
+        assert!(t[6..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn hashrate_target_decreases_with_higher_hashrate() {
+        // Threshold for difficulty > 1: hashrate > 2^32 / 30 ≈ 143 MH/s.
+        // Use 1 TH/s (clearly above threshold) vs 1 H/s (clamped to diff 1).
+        let easy = hashrate_to_target_be(1.0);          // diff 1 (clamped)
+        let hard = hashrate_to_target_be(1e12);         // diff ≈ 7000
+        assert!(hard < easy, "higher hashrate must produce a lower (stricter) target");
+    }
+
+    #[test]
+    fn hashrate_target_not_all_zero() {
+        // Target must be a non-zero value.
+        let t = hashrate_to_target_be(500_000.0);
+        assert!(t.iter().any(|&b| b != 0));
     }
 
     #[test]

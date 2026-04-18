@@ -16,7 +16,10 @@ use std::{
     time::Duration,
 };
 
-use bitcoin::hashes::{sha256d, Hash};
+use bitcoin::{
+    base58,
+    hashes::{sha256d, Hash},
+};
 use pool::{
     rpc::RpcClient,
     stratum_sv2::{AuthorityKeypair, Sv2Server},
@@ -45,6 +48,8 @@ fn regtest_client() -> RpcClient {
 }
 
 /// Generate a fresh authority keypair.
+///
+/// Returns (xonly_pub_32, priv_32).
 fn generate_keypair() -> ([u8; 32], [u8; 32]) {
     let secp = Secp256k1::new();
     let kp = Keypair::new(&secp, &mut thread_rng());
@@ -52,30 +57,15 @@ fn generate_keypair() -> ([u8; 32], [u8; 32]) {
     (xonly.serialize(), kp.secret_key().secret_bytes())
 }
 
-/// Encode 32-byte hex key as base58 (no checksum).
-fn hex_to_b58(hex: &str) -> String {
-    const ALPHA: &[u8] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
-    let bytes = hex::decode(hex).expect("hex_to_b58: invalid hex");
-    let mut digits = bytes;
-    let mut result = Vec::<u8>::new();
-
-    while !digits.iter().all(|&d| d == 0) {
-        let mut carry = 0u32;
-        for d in digits.iter_mut() {
-            let val = carry * 256 + *d as u32;
-            *d = (val / 58) as u8;
-            carry = val % 58;
-        }
-        result.push(ALPHA[carry as usize]);
-    }
-
-    result.reverse();
-    String::from_utf8(result).unwrap()
-}
-
 /// Write a temporary translator config and spawn translator_sv2 as a subprocess.
-fn start_translator(pool_port: u16, authority_pubkey_hex: &str) -> Child {
-    let pubkey_b58 = hex_to_b58(authority_pubkey_hex);
+///
+/// `xonly_pubkey` must be the 32-byte x-only pool authority key.
+/// The translator expects bs58check([version_u16_le=1] ++ xonly_32_bytes).
+fn start_translator(pool_port: u16, xonly_pubkey: &[u8; 32]) -> Child {
+    let mut key_buf = [0u8; 34];
+    key_buf[0] = 1; // version = 1, little-endian u16
+    key_buf[2..].copy_from_slice(xonly_pubkey);
+    let pubkey_b58 = base58::encode_check(&key_buf);
 
     let conf_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -90,6 +80,13 @@ min_supported_version = 2
 downstream_extranonce2_size = 4
 user_identity = "test-miner"
 aggregate_channels = false
+supported_extensions = []
+
+[downstream_difficulty_config]
+min_individual_miner_hashrate = 0.01
+shares_per_minute = 6.0
+enable_vardiff = true
+job_keepalive_interval_secs = 60
 
 [[upstreams]]
 address = "127.0.0.1"
@@ -103,22 +100,22 @@ authority_pubkey = "{pubkey_b58}"
     Command::new("translator_sv2")
         .arg("-c")
         .arg(&conf_path)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
         .spawn()
         .expect("spawn translator_sv2 — run from inside nix develop")
 }
 
-/// Wait until a TCP port is listening (poll every 200 ms, up to 15 s).
-fn wait_for_port(port: u16) {
+/// Wait until a TCP port accepts connections (async, poll every 200 ms, up to 20 s).
+async fn wait_for_port(port: u16) {
     let addr = format!("127.0.0.1:{port}");
-    for _ in 0..75 {
-        if std::net::TcpStream::connect(&addr).is_ok() {
+    for _ in 0..100 {
+        if tokio::net::TcpStream::connect(&addr).await.is_ok() {
             return;
         }
-        std::thread::sleep(Duration::from_millis(200));
+        sleep(Duration::from_millis(200)).await;
     }
-    panic!("port {port} did not become available within 15 s");
+    panic!("port {port} did not become available within 20 s");
 }
 
 /// Send a JSON-RPC line and return the raw response line.
@@ -135,7 +132,7 @@ fn send_line(stream: &mut std::net::TcpStream, msg: &Value) -> String {
 ///
 /// Verifies that a block mined by an SV1 client propagates through the entire
 /// stack and is accepted by Bitcoin Core (block height increases).
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sv1_mine_block_through_translator() {
     let rpc = regtest_client();
 
@@ -143,7 +140,6 @@ async fn sv1_mine_block_through_translator() {
 
     let (pub_key, priv_key) = generate_keypair();
     let authority = AuthorityKeypair { public: pub_key, private: priv_key };
-    let pubkey_hex = hex::encode(pub_key);
 
     let tp_pubkey = template_client::read_authority_pubkey(&datadir())
         .expect("read sv2_authority_key — run `just start-all` first");
@@ -165,13 +161,20 @@ async fn sv1_mine_block_through_translator() {
         }
     });
 
-    sleep(Duration::from_millis(200)).await;
+    // Wait for the pool to bind its port before starting the translator.
+    wait_for_port(POOL_PORT).await;
 
     // ── Start translator ─────────────────────────────────────────────────────
 
-    let mut translator = start_translator(POOL_PORT, &pubkey_hex);
+    let mut translator = start_translator(POOL_PORT, &pub_key);
 
-    wait_for_port(SV1_PORT);
+    // Give the translator time to start and check it didn't crash immediately.
+    sleep(Duration::from_millis(500)).await;
+    if let Ok(Some(status)) = translator.try_wait() {
+        panic!("translator_sv2 exited immediately with status: {status}");
+    }
+
+    wait_for_port(SV1_PORT).await;
 
     // ── SV1 handshake ────────────────────────────────────────────────────────
 
