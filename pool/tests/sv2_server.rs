@@ -207,20 +207,6 @@ async fn sv2_server_open_extended_channel() {
     );
     let channel_id = ch_success.channel_id;
 
-    // ── SetNewPrevHash ───────────────────────────────────────────────────────
-
-    let mut payload = read_expect(&mut reader, MESSAGE_TYPE_MINING_SET_NEW_PREV_HASH)
-        .await
-        .expect("receive SetNewPrevHash");
-    let prev_hash: SetNewPrevHash =
-        binary_sv2::from_bytes(&mut payload).expect("parse SetNewPrevHash");
-
-    assert_eq!(
-        prev_hash.channel_id, channel_id,
-        "SetNewPrevHash channel_id must match"
-    );
-    assert!(prev_hash.nbits > 0, "nbits must be positive");
-
     // ── NewExtendedMiningJob ─────────────────────────────────────────────────
 
     let mut payload = read_expect(&mut reader, MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB)
@@ -242,4 +228,20 @@ async fn sv2_server_open_extended_channel() {
         "coinbase_tx_suffix must not be empty"
     );
     assert!(job.version > 0, "version must be positive");
+    assert!(job.is_future(), "initial job must be a future job");
+
+    // ── SetNewPrevHash ───────────────────────────────────────────────────────
+
+    let mut payload = read_expect(&mut reader, MESSAGE_TYPE_MINING_SET_NEW_PREV_HASH)
+        .await
+        .expect("receive SetNewPrevHash");
+    let prev_hash: SetNewPrevHash =
+        binary_sv2::from_bytes(&mut payload).expect("parse SetNewPrevHash");
+
+    assert_eq!(
+        prev_hash.channel_id, channel_id,
+        "SetNewPrevHash channel_id must match"
+    );
+    assert!(prev_hash.nbits > 0, "nbits must be positive");
+    assert_eq!(prev_hash.job_id, job.job_id, "SetNewPrevHash must reference the sent job");
 }
