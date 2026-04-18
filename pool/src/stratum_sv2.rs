@@ -84,8 +84,9 @@ struct JobInfo {
 /// State for a single open extended channel.
 struct ChannelInfo {
     channel_id: u32,
-    /// First 4 bytes of extranonce_prefix used to reconstruct the coinbase.
-    extranonce1: [u8; 4],
+    /// Full 32-byte extranonce_prefix sent to the miner in OpenExtendedMiningChannelSuccess.
+    /// Stored whole so share reconstruction is independent of how the prefix is built.
+    extranonce_prefix: [u8; 32],
     /// Bitcoin address for this miner's coinbase output.
     miner_address: String,
     /// Most recent job sent to this channel.
@@ -381,7 +382,13 @@ async fn handle_open_extended_mining_channel(
     let miner_address = parse_miner_address(&user_identity, &state.pool_address);
 
     let channel_id = state.alloc_channel_id();
-    let extranonce1 = channel_id.to_le_bytes();
+
+    // Build extranonce_prefix: channel_id (4 bytes LE) padded to 32 bytes.
+    // Stored in full so share reconstruction always mirrors what was sent to the miner.
+    let mut extranonce_prefix = [0u8; 32];
+    extranonce_prefix[..4].copy_from_slice(&channel_id.to_le_bytes());
+    let extranonce_prefix_sv2: B032<'static> = B032::try_from(extranonce_prefix.to_vec())
+        .expect("extranonce_prefix is 32 bytes, within B032 max");
 
     // Compute per-channel share target from the miner's declared hashrate,
     // clamped so it is never harder than the current network target.
@@ -405,18 +412,12 @@ async fn handle_open_extended_mining_channel(
         "OpenExtendedMiningChannel"
     );
 
-    // Build extranonce_prefix: 4 bytes extranonce1 padded to 32 bytes.
-    let mut prefix_bytes = [0u8; 32];
-    prefix_bytes[..4].copy_from_slice(&extranonce1);
-    let extranonce_prefix: B032<'static> = B032::try_from(prefix_bytes.to_vec())
-        .expect("prefix_bytes <= 32 bytes, within B032 max");
-
     let success = OpenExtendedMiningChannelSuccess {
         request_id,
         channel_id,
         target: channel_target_sv2,
         extranonce_size: SV2_EXTRANONCE2_SIZE as u16,
-        extranonce_prefix,
+        extranonce_prefix: extranonce_prefix_sv2,
         group_channel_id: 0,
     };
 
@@ -428,7 +429,7 @@ async fn handle_open_extended_mining_channel(
     info!(%peer_addr, channel_id, "OpenExtendedMiningChannelSuccess sent");
 
     // Register the channel.
-    let channel = ChannelInfo { channel_id, extranonce1, miner_address, current_job: None, channel_target_be };
+    let channel = ChannelInfo { channel_id, extranonce_prefix, miner_address, current_job: None, channel_target_be };
     state.channels.insert(channel_id, channel);
 
     // Send the first job immediately.
@@ -635,11 +636,8 @@ async fn handle_submit_shares_extended(
     }
 
     // Reconstruct coinbase: coinb1 + extranonce_prefix(32) + extranonce2(4) + coinb2
-    let mut full_extranonce = [0u8; SV2_EXTRANONCE_TOTAL];
-    full_extranonce[..4].copy_from_slice(&channel.extranonce1);
     let ext2 = share.extranonce.inner_as_ref();
-    let ext2_len = ext2.len().min(SV2_EXTRANONCE_TOTAL - 32);
-    full_extranonce[32..32 + ext2_len].copy_from_slice(&ext2[..ext2_len]);
+    let full_extranonce = build_full_extranonce(&channel.extranonce_prefix, ext2);
 
     let mut coinbase = job.coinb1.clone();
     coinbase.extend_from_slice(&full_extranonce);
@@ -812,6 +810,24 @@ fn target_be_to_sv2(target_be: &[u8; 32]) -> Result<U256<'static>> {
     U256::try_from(le.to_vec()).map_err(|e| anyhow::anyhow!("target_be_to_sv2: {e:?}"))
 }
 
+// ── Extranonce reconstruction ─────────────────────────────────────────────────
+
+/// Assemble the full 36-byte extranonce from the 32-byte prefix stored in
+/// `ChannelInfo` and the 4-byte `extranonce2` received in `SubmitSharesExtended`.
+///
+/// Layout (matches `build_sv2_coinbase_from_tdp`):
+///   `extranonce_prefix (32 B) || extranonce2 (4 B)`
+///
+/// Using the full prefix — rather than only its first 4 bytes — makes the
+/// reconstruction independent of how the prefix happens to be laid out.
+fn build_full_extranonce(prefix: &[u8; 32], ext2: &[u8]) -> [u8; SV2_EXTRANONCE_TOTAL] {
+    let mut out = [0u8; SV2_EXTRANONCE_TOTAL];
+    out[..32].copy_from_slice(prefix);
+    let ext2_len = ext2.len().min(SV2_EXTRANONCE2_SIZE);
+    out[32..32 + ext2_len].copy_from_slice(&ext2[..ext2_len]);
+    out
+}
+
 // ── Unit tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -934,5 +950,89 @@ mod tests {
     fn parse_miner_address_fallback() {
         let pool = "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq";
         assert_eq!(parse_miner_address("not-a-valid-address", pool), pool);
+    }
+
+    // ── build_full_extranonce ─────────────────────────────────────────────────
+
+    #[test]
+    fn full_extranonce_prefix_copied_verbatim() {
+        let mut prefix = [0u8; 32];
+        // channel_id = 7 in LE
+        prefix[..4].copy_from_slice(&7u32.to_le_bytes());
+        let ext2 = [0xaa, 0xbb, 0xcc, 0xdd];
+
+        let out = build_full_extranonce(&prefix, &ext2);
+
+        assert_eq!(&out[..32], &prefix, "prefix must be copied verbatim into positions 0-31");
+        assert_eq!(&out[32..36], &ext2, "ext2 must appear in positions 32-35");
+    }
+
+    #[test]
+    fn full_extranonce_nonzero_middle_bytes_preserved() {
+        // If the prefix has non-zero bytes beyond position 3, they must survive.
+        let mut prefix = [0xeeu8; 32];
+        prefix[..4].copy_from_slice(&1u32.to_le_bytes());
+        let ext2 = [0x01, 0x02, 0x03, 0x04];
+
+        let out = build_full_extranonce(&prefix, &ext2);
+
+        // Bytes 4-31 of the prefix must not be zeroed out.
+        assert!(out[4..32].iter().all(|&b| b == 0xee), "middle prefix bytes must not be zeroed");
+        assert_eq!(&out[32..36], &ext2);
+    }
+
+    #[test]
+    fn full_extranonce_short_ext2_pads_with_zeros() {
+        let prefix = [0u8; 32];
+        let ext2 = [0xff, 0xff]; // only 2 bytes instead of 4
+
+        let out = build_full_extranonce(&prefix, &ext2);
+
+        assert_eq!(out[32], 0xff);
+        assert_eq!(out[33], 0xff);
+        assert_eq!(out[34], 0x00, "byte 34 must be zero-padded");
+        assert_eq!(out[35], 0x00, "byte 35 must be zero-padded");
+    }
+
+    #[test]
+    fn full_extranonce_total_length_is_36() {
+        let out = build_full_extranonce(&[0u8; 32], &[0u8; 4]);
+        assert_eq!(out.len(), SV2_EXTRANONCE_TOTAL);
+    }
+
+    #[test]
+    fn full_extranonce_matches_coinbase_split_roundtrip() {
+        use crate::jobs::{build_sv2_coinbase_from_tdp, script_from_address};
+
+        let prefix_script = b"\x03\x01\x00\x00"; // height = 1 (BIP34 script)
+        let channel_id = 42u32;
+        let mut extranonce_prefix = [0u8; 32];
+        extranonce_prefix[..4].copy_from_slice(&channel_id.to_le_bytes());
+        let ext2 = [0x11u8; SV2_EXTRANONCE2_SIZE];
+
+        let miner_script = script_from_address("bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq").unwrap();
+        let parts = build_sv2_coinbase_from_tdp(
+            prefix_script,
+            2,   // version
+            0xffff_ffff,
+            5_000_000_000,
+            0,   // no extra outputs
+            &[],
+            0,   // locktime
+            miner_script,
+            false,
+        );
+
+        // Reconstruct the coinbase bytes the same way handle_submit_shares_extended does.
+        let full_extranonce = build_full_extranonce(&extranonce_prefix, &ext2);
+        let mut coinbase = parts.coinb1.clone();
+        coinbase.extend_from_slice(&full_extranonce);
+        coinbase.extend_from_slice(&parts.coinb2);
+
+        // The reassembled bytes must deserialize as a valid Bitcoin transaction.
+        let tx: bitcoin::Transaction = bitcoin::consensus::deserialize(&coinbase)
+            .expect("reassembled coinbase must be a valid transaction");
+        assert_eq!(tx.input.len(), 1);
+        assert!(tx.input[0].previous_output.is_null());
     }
 }
