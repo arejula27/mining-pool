@@ -52,6 +52,10 @@ cli *args:
 mine n="1":
     {{cli}} generatetoaddress {{n}} $({{cli}} getnewaddress)
 
+# Wipe regtest chain data — run stop-all first, caller restarts the node
+reset-chain:
+    rm -rf {{data_dir}}/regtest
+
 # ── sv2-tp ────────────────────────────────────────────────────────────────────
 
 # Start sv2-tp in the background (requires bitcoin-node already running)
@@ -155,7 +159,14 @@ unit:
 test-integration:
     #!/usr/bin/env bash
     just start-all || exit 1
-    cargo test --manifest-path pool/Cargo.toml --tests -- --nocapture --test-threads=1
+    just mine 1
+    cargo test --manifest-path pool/Cargo.toml \
+        --test rpc \
+        --test template_client \
+        --test mine_block \
+        --test sv2_server \
+        --test sv1_miner \
+        -- --nocapture --test-threads=1
     EXIT=$?
     just stop-all
     exit $EXIT
@@ -175,6 +186,7 @@ alias int-rpc := test-integration-rpc
 test-integration-tdp:
     #!/usr/bin/env bash
     just start-all || exit 1
+    just mine 1
     cargo test --manifest-path pool/Cargo.toml --test template_client -- --nocapture --test-threads=1
     EXIT=$?
     just stop-all
@@ -185,6 +197,7 @@ alias int-tdp := test-integration-tdp
 test-integration-mine:
     #!/usr/bin/env bash
     just start-all || exit 1
+    just mine 1
     cargo test --manifest-path pool/Cargo.toml --test mine_block -- --nocapture --test-threads=1
     EXIT=$?
     just stop-all
@@ -194,7 +207,11 @@ alias int-mine := test-integration-mine
 # Run the sv1_miner end-to-end test (starts bitcoin-node + sv2-tp, pool and translator are spawned by the test)
 test-integration-sv1:
     #!/usr/bin/env bash
+    just stop-all 2>/dev/null || true
+    pkill translator_sv2 2>/dev/null || true
+    just reset-chain
     just start-all || exit 1
+    just mine 1
     cargo test --manifest-path pool/Cargo.toml --test sv1_miner -- --nocapture --test-threads=1
     EXIT=$?
     just stop-all

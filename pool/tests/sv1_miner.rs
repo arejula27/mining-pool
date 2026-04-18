@@ -3,7 +3,7 @@
 //! Flow:
 //!   sv1_miner (this test) ──SV1──▶ translator_sv2 ──SV2──▶ our pool (Sv2Server)
 //!   pool ──SubmitSolution──▶ sv2-tp ──submitblock──▶ bitcoin-core
-//!   assert block height increased
+//!   assert block height increased, mine 100 maturity blocks, spend coinbase
 //!
 //! Requires `just start-all` (bitcoin-node + sv2-tp) before running.
 //! Pool and translator are spawned in-process / as subprocess by this test.
@@ -21,7 +21,7 @@ use bitcoin::{
     hashes::{sha256d, Hash},
 };
 use pool::{
-    rpc::RpcClient,
+    rpc::{RpcClient, REGTEST_BURN_ADDR},
     stratum_sv2::{AuthorityKeypair, Sv2Server},
     template_client,
 };
@@ -131,10 +131,19 @@ fn send_line(stream: &mut std::net::TcpStream, msg: &Value) -> String {
 /// Full SV1→translator→pool→sv2-tp→bitcoin-core mining flow.
 ///
 /// Verifies that a block mined by an SV1 client propagates through the entire
-/// stack and is accepted by Bitcoin Core (block height increases).
+/// stack, is accepted by Bitcoin Core, matures after 100 blocks, and the
+/// coinbase reward can be spent by the pool wallet.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sv1_mine_block_through_translator() {
     let rpc = regtest_client();
+
+    // ── Setup wallet and get coinbase address ────────────────────────────────
+
+    rpc.create_wallet("pool-test").await.expect("create or load wallet");
+    let wallet_rpc = RpcClient::with_wallet("http://127.0.0.1:18443", "pool", "poolpass", "pool-test");
+    // Address owned by our wallet — used as SV1 miner username so the coinbase
+    // output is credited to the wallet and can be spent after maturity.
+    let miner_address = wallet_rpc.get_new_address().await.expect("get miner address");
 
     // ── Start our pool ───────────────────────────────────────────────────────
 
@@ -152,8 +161,7 @@ async fn sv1_mine_block_through_translator() {
     .expect("connect to sv2-tp");
 
     let pool_addr: SocketAddr = format!("127.0.0.1:{POOL_PORT}").parse().unwrap();
-    let pool_address = "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq".to_string();
-    let server = Sv2Server::new(authority, pool_addr, template_rx, pool_address, solution_tx);
+    let server = Sv2Server::new(authority, pool_addr, template_rx, miner_address.clone(), solution_tx);
 
     tokio::spawn(async move {
         if let Err(e) = server.run().await {
@@ -202,10 +210,11 @@ async fn sv1_mine_block_through_translator() {
     let extranonce2_size = sub["result"][2].as_u64().expect("extranonce2_size missing") as usize;
     assert_eq!(extranonce2_size, 4, "expected extranonce2_size=4");
 
-    // mining.authorize
+    // mining.authorize — pass wallet address as username so the coinbase output
+    // is credited to an address the wallet controls.
     send_line(
         &mut stream,
-        &json!({"id": 2, "method": "mining.authorize", "params": ["test-miner", ""]}),
+        &json!({"id": 2, "method": "mining.authorize", "params": [&miner_address, ""]}),
     );
 
     // Drain lines until we have an authorize response and a mining.notify.
@@ -341,7 +350,7 @@ async fn sv1_mine_block_through_translator() {
         &json!({
             "id": 4,
             "method": "mining.submit",
-            "params": ["test-miner", job_id, extranonce2_hex, ntime_submit, nonce_submit]
+            "params": [&miner_address, job_id, extranonce2_hex, ntime_submit, nonce_submit]
         }),
     );
 
@@ -353,6 +362,24 @@ async fn sv1_mine_block_through_translator() {
         height_after > height_before,
         "block count must increase (before={height_before}, after={height_after})"
     );
+
+    // ── Mine 100 maturity blocks ─────────────────────────────────────────────
+
+    // Coinbase outputs require 100 confirmations before they can be spent
+    // (COINBASE_MATURITY). Mine to a burn address so the wallet only holds
+    // the one mature coinbase we care about.
+    rpc.generate_to_address(100, REGTEST_BURN_ADDR)
+        .await
+        .expect("mine maturity blocks");
+
+    // ── Spend the coinbase ───────────────────────────────────────────────────
+
+    let recipient = wallet_rpc.get_new_address().await.expect("get recipient address");
+    let spend_txid = wallet_rpc
+        .send_to_address(&recipient, 10.0)
+        .await
+        .expect("spend coinbase reward");
+    assert!(!spend_txid.is_empty(), "coinbase spend txid must be non-empty");
 
     // ── Cleanup ──────────────────────────────────────────────────────────────
 

@@ -10,26 +10,73 @@ Do not use `cargo` directly. Use the `just` recipes below instead.
 
 ## Commands
 
+### Build and test
+
 | Command | What it does |
 |---|---|
 | `just check` | `cargo check` including test targets |
-| `just unit` | Run unit tests (no bitcoind required) |
+| `just unit` | Run unit tests from `src/` only (`--lib`, no node required) |
 | `just clean` | Remove build artifacts |
-| `just int` | Start regtest, run all integration tests, stop regtest |
-| `just int-rpc` | Same but only the `tests/rpc.rs` suite |
-| `just start` | Start bitcoind in regtest (background daemon) |
-| `just stop` | Stop bitcoind via RPC |
-| `just kill` | Force-kill bitcoind (when RPC is unavailable) |
-| `just mine [n]` | Mine `n` blocks to a throwaway address |
-| `just node-check` | Verify bitcoind RPC is responding |
-| `bcli <args>` | Run `bitcoin-cli` against the local regtest node |
+| `just int` | Start full environment, run all integration tests (`tests/`), stop |
+| `just int-rpc` | Start bitcoin-node only, run `tests/rpc.rs`, stop |
+| `just int-tdp` | Start full environment, run `tests/template_client.rs`, stop |
+| `just int-mine` | Start full environment, run `tests/mine_block.rs`, stop |
+| `just int-sv1` | Start full environment, run `tests/sv1_miner.rs`, stop |
 
-To run a single integration test:
+### Pool
+
+| Command | What it does |
+|---|---|
+| `just keygen` | Generate a fresh SV2 authority keypair and append it to `.env` |
+| `just run` | Run the pool binary (sources `.env` if it exists) |
+
+### Bitcoin node
+
+| Command | What it does |
+|---|---|
+| `just start` | Start bitcoin-node in regtest (background daemon) |
+| `just stop` | Stop bitcoin-node via RPC |
+| `just kill` | Force-kill bitcoin-node (when RPC is unavailable) |
+| `just mine [n]` | Mine `n` blocks to a throwaway address |
+| `just node-check` | Verify bitcoin-node RPC is responding |
+| `just cli <args>` | Run `bitcoin-cli` against the local regtest node |
+
+### sv2-tp (Template Provider)
+
+| Command | What it does |
+|---|---|
+| `just start-sv2-tp` | Start sv2-tp in the background (requires bitcoin-node) |
+| `just stop-sv2-tp` | Stop sv2-tp |
+
+### Translator (SV1 → SV2)
+
+| Command | What it does |
+|---|---|
+| `just start-translator` | Start translator_sv2 (requires pool running on :3333) |
+| `just stop-translator` | Stop the translator |
+
+### Combined
+
+| Command | What it does |
+|---|---|
+| `just start-all` | Start bitcoin-node + sv2-tp |
+| `just stop-all` | Stop sv2-tp + bitcoin-node |
+| `just kill-all` | Force-kill translator, sv2-tp, and bitcoin-node |
+
+To run a single integration test manually:
 ```
-just start
-cargo test --manifest-path pool/Cargo.toml --test rpc <test_name> -- --nocapture
-just stop
+just start-all
+cargo test --manifest-path pool/Cargo.toml --test <suite> <test_name> -- --nocapture
+just stop-all
 ```
+
+### What just manages vs what tests spawn
+
+`just start-all` starts the persistent shared infrastructure (bitcoin-node, sv2-tp).
+Integration tests that need the pool server (`sv2_server.rs`, `sv1_miner.rs`) spawn it
+in-process via `tokio::spawn`. `sv1_miner.rs` also spawns `translator_sv2` as a subprocess
+because it generates an ephemeral keypair per run and must configure the translator with
+that same key; using `just start-translator` (which reads `.env`) would break test isolation.
 
 ## Target architecture
 
@@ -59,12 +106,14 @@ Bitcoin node config is in `bitcoin/bitcoin.conf` (tracked in git, regtest). Bloc
 
 ### Modules (current)
 
-- **`rpc`** — `RpcClient` (JSON-RPC over HTTP via `reqwest`/`rustls`) and `TemplatePoller`. The poller uses Bitcoin Core's long-polling (`longpollid`) to detect new blocks and broadcasts updated `BlockTemplate`s over a `tokio::sync::watch` channel. **Temporary**: will be replaced by the SV2 Template Distribution Protocol client (Paso 4b).
+- **`config`** — reads `STRATUM_PORT`, `POOL_ADDRESS`, `POOL_AUTHORITY_PUBLIC_KEY`, `POOL_AUTHORITY_PRIVATE_KEY`, `TP_ADDRESS` from environment variables (sourced from `.env` via `just run`).
 
-- **`config`** — reads `RPC_URL`, `RPC_USER`, `RPC_PASS`, `STRATUM_PORT`, `POOL_ADDRESS` from environment variables.
+- **`jobs`** — Protocol-agnostic coinbase and merkle construction. `build_sv2_coinbase_from_tdp` builds the segwit coinbase from TDP data; `build_merkle_branch` computes sibling hashes. `pool/tests/fixtures/block_250000.json` is a real-block fixture for unit tests.
 
-- **`jobs`** — Protocol-agnostic coinbase and merkle construction. `build_coinbase_parts` builds the coinbase split at the extranonce placeholder; `build_merkle_branch` computes sibling hashes in internal byte order. `pool/tests/fixtures/block_250000.json` is a real-block fixture for unit tests. Will gain a `build_sv2_job` function alongside the existing SV1 one.
+- **`template_client`** — SV2 Template Distribution Protocol client. Connects to sv2-tp (default `127.0.0.1:18447`), completes the Noise initiator handshake, sends `SetupConnection` + `CoinbaseOutputConstraints`, and receives `NewTemplate` + `SetNewPrevHash`. Broadcasts templates over a `tokio::sync::watch` channel and accepts `SubmitSolution` via an `mpsc::Sender`.
 
-### Planned modules (see ACTION_PLAN.md)
+- **`stratum_sv2`** — SV2 Mining Protocol server. TCP listener with Noise NX responder handshake per connection. Handles `SetupConnection`, `OpenExtendedMiningChannel`, and `SubmitShares`. Sends `NewExtendedMiningJob` and `SetNewPrevHash` to connected channels when a new template arrives.
 
-`stratum_sv2` (SV2 Mining Protocol server using `roles_logic_sv2` + `mining_sv2` + `noise_sv2`), `template_client` (SV2 Template Distribution Protocol, replacing `rpc`), `shares` (validation), `db` (SQLite).
+- **`noise_connection`** — Thin helpers around `noise_sv2` and `codec_sv2`: `connect_noise` completes either initiator or responder handshake and returns typed read/write halves.
+
+- **`rpc`** — `RpcClient` (JSON-RPC over HTTP via `reqwest`/`rustls`). Used by integration tests to call `generatetoaddress`, `getblockcount`, etc. against the local regtest node.

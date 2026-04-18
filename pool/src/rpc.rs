@@ -3,6 +3,10 @@ use reqwest::Client;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+/// Regtest burn address (no known private key). Use as coinbase sink when
+/// mining maturity blocks in tests so those rewards never pollute the test wallet.
+pub const REGTEST_BURN_ADDR: &str = "bcrt1q5g2mvp22j0d5wedehln3rcqvtegvrj6xgdpmc6";
+
 #[derive(Debug, Clone)]
 pub struct RpcClient {
     client: Client,
@@ -19,6 +23,11 @@ impl RpcClient {
             user: user.to_string(),
             pass: pass.to_string(),
         }
+    }
+
+    /// Build a client scoped to a specific wallet (uses `/wallet/<name>` path).
+    pub fn with_wallet(url: &str, user: &str, pass: &str, wallet: &str) -> Self {
+        Self::new(&format!("{}/wallet/{}", url.trim_end_matches('/'), wallet), user, pass)
     }
 
     async fn call(&self, method: &str, params: Value) -> Result<Value> {
@@ -94,6 +103,35 @@ impl RpcClient {
             .as_str()
             .map(|s| s.to_string())
             .context("getnewaddress did not return a string")
+    }
+
+    /// Return wallet balances as a raw JSON value.  Regtest only.
+    pub async fn get_balances(&self) -> Result<Value> {
+        self.call("getbalances", json!([])).await
+    }
+
+    /// Create a named wallet, loading it if it already exists on disk.  Regtest only.
+    pub async fn create_wallet(&self, name: &str) -> Result<()> {
+        match self.call("createwallet", json!([name])).await {
+            Ok(_) => return Ok(()),
+            Err(e) => {
+                let msg = e.to_string();
+                if !msg.contains("already exists") && !msg.contains("Database already exists") {
+                    return Err(e);
+                }
+            }
+        }
+        // Wallet file exists but may not be loaded — try loadwallet.
+        match self.call("loadwallet", json!([name])).await {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                if e.to_string().contains("already loaded") {
+                    Ok(())
+                } else {
+                    Err(e)
+                }
+            }
+        }
     }
 
     /// Send `amount_btc` to `address` and return the txid.  Regtest only.

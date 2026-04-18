@@ -106,7 +106,11 @@ just stop-all
 ## Development
 
 ```
-just check    # compile-check including test targets
-just unit     # run unit tests (no node required)
-just int      # start regtest, run all integration tests, stop regtest
+just check      # compile-check including test targets
+just unit       # run unit tests from src/ (no node required)
+just int        # start full environment, run all integration tests, stop
+just int-rpc    # bitcoin-node only, run tests/rpc.rs
+just int-tdp    # full environment, run tests/template_client.rs
+just int-mine   # full environment, run tests/mine_block.rs
+just int-sv1    # full environment, run tests/sv1_miner.rs
 ```
