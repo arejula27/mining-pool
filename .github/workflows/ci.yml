@@ -18,19 +18,18 @@ jobs:
 
       - uses: cachix/install-nix-action@v27
 
-      - name: Cache Cargo registry
-        uses: actions/cache@v4
+      - uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-          key: cargo-${{ runner.os }}-${{ hashFiles('pool/Cargo.lock') }}
-          restore-keys: cargo-${{ runner.os }}-
+          key: cargo-registry-${{ runner.os }}-${{ hashFiles('pool/Cargo.lock') }}
+          restore-keys: cargo-registry-${{ runner.os }}-
 
       - run: nix develop --command just check
 
-  unit:
-    name: Unit tests
+  build:
+    name: Build
     needs: check
     runs-on: ubuntu-latest
     steps:
@@ -38,33 +37,63 @@ jobs:
 
       - uses: cachix/install-nix-action@v27
 
-      - name: Cache Cargo registry
-        uses: actions/cache@v4
+      - uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-          key: cargo-${{ runner.os }}-${{ hashFiles('pool/Cargo.lock') }}
-          restore-keys: cargo-${{ runner.os }}-
+          key: cargo-registry-${{ runner.os }}-${{ hashFiles('pool/Cargo.lock') }}
+          restore-keys: cargo-registry-${{ runner.os }}-
+
+      - uses: actions/cache@v4
+        with:
+          path: pool/target
+          key: cargo-target-${{ runner.os }}-${{ hashFiles('pool/Cargo.lock') }}-${{ github.sha }}
+
+      - run: nix develop --command cargo build --manifest-path pool/Cargo.toml --tests
+
+  unit:
+    name: Unit tests
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: cachix/install-nix-action@v27
+
+      - uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-registry-${{ runner.os }}-${{ hashFiles('pool/Cargo.lock') }}
+
+      - uses: actions/cache/restore@v4
+        with:
+          path: pool/target
+          key: cargo-target-${{ runner.os }}-${{ hashFiles('pool/Cargo.lock') }}-${{ github.sha }}
 
       - run: nix develop --command just unit
 
   integration:
     name: Integration tests
-    needs: check
+    needs: build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       - uses: cachix/install-nix-action@v27
 
-      - name: Cache Cargo registry
-        uses: actions/cache@v4
+      - uses: actions/cache/restore@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-          key: cargo-${{ runner.os }}-${{ hashFiles('pool/Cargo.lock') }}
-          restore-keys: cargo-${{ runner.os }}-
+          key: cargo-registry-${{ runner.os }}-${{ hashFiles('pool/Cargo.lock') }}
+
+      - uses: actions/cache/restore@v4
+        with:
+          path: pool/target
+          key: cargo-target-${{ runner.os }}-${{ hashFiles('pool/Cargo.lock') }}-${{ github.sha }}
 
       - run: nix develop --command just int

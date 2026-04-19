@@ -1,5 +1,5 @@
 # mining-pool
-
+[![CI](https://github.com/arejula27/mining-pool/actions/workflows/ci.yml/badge.svg)](https://github.com/arejula27/mining-pool/actions/workflows/ci.yml)
 A lottery-style Bitcoin mining pool implementing the Stratum V2 protocol. Each miner that connects sets their own Bitcoin address as the coinbase recipient: if they find a block, the full subsidy and fees go directly to them. On top of that, participants who pay a monthly fee enter an epoch competition where the miner with the best share difficulty wins the entire pot.
 
 The pool is designed for small home miners using Bitaxe and NerdAxe devices. SV1 devices connect through the official `translator_sv2` proxy from the sv2-apps project; the pool itself only speaks SV2.
@@ -110,7 +110,6 @@ just check      # compile-check including test targets
 just unit       # run unit tests from src/ (no node required)
 just int        # start full environment, run all integration tests, stop
 just int-rpc    # bitcoin-node only, run tests/rpc.rs
-just int-tdp    # full environment, run tests/template_client.rs
 just int-mine   # full environment, run tests/mine_block.rs
 just int-sv1    # full environment, run tests/sv1_miner.rs
 ```
