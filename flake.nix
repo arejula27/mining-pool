@@ -86,6 +86,8 @@
 
 						# Build deps
 						pkgs.pkg-config
+						pkgs.capnproto
+						pkgs.sqlite
 					];
 
 					RUST_BACKTRACE = "1";
