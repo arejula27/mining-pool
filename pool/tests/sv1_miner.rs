@@ -13,7 +13,7 @@ use std::{
     io::{BufRead, BufReader, Write},
     net::SocketAddr,
     process::{Child, Command, Stdio},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use bitcoin::{
@@ -21,6 +21,7 @@ use bitcoin::{
     hashes::{sha256d, Hash},
 };
 use pool::{
+    db::DbEvent,
     rpc::{RpcClient, REGTEST_BURN_ADDR},
     stratum_sv2::{AuthorityKeypair, Sv2Server},
     template_client,
@@ -61,7 +62,7 @@ fn generate_keypair() -> ([u8; 32], [u8; 32]) {
 ///
 /// `xonly_pubkey` must be the 32-byte x-only pool authority key.
 /// The translator expects bs58check([version_u16_le=1] ++ xonly_32_bytes).
-fn start_translator(pool_port: u16, xonly_pubkey: &[u8; 32]) -> Child {
+fn start_translator(pool_port: u16, sv1_port: u16, conf_name: &str, xonly_pubkey: &[u8; 32]) -> Child {
     let mut key_buf = [0u8; 34];
     key_buf[0] = 1; // version = 1, little-endian u16
     key_buf[2..].copy_from_slice(xonly_pubkey);
@@ -70,11 +71,11 @@ fn start_translator(pool_port: u16, xonly_pubkey: &[u8; 32]) -> Child {
     let conf_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .unwrap()
-        .join(".translator-test.toml");
+        .join(conf_name);
 
     let conf = format!(
         r#"downstream_address = "0.0.0.0"
-downstream_port = {SV1_PORT}
+downstream_port = {sv1_port}
 max_supported_version = 2
 min_supported_version = 2
 downstream_extranonce2_size = 4
@@ -135,6 +136,10 @@ fn send_line(stream: &mut std::net::TcpStream, msg: &Value) -> String {
 /// coinbase reward can be spent by the pool wallet.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sv1_mine_block_through_translator() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .try_init();
+
     let rpc = regtest_client();
 
     // ── Setup wallet and get coinbase address ────────────────────────────────
@@ -161,7 +166,7 @@ async fn sv1_mine_block_through_translator() {
     .expect("connect to sv2-tp");
 
     let pool_addr: SocketAddr = format!("127.0.0.1:{POOL_PORT}").parse().unwrap();
-    let server = Sv2Server::new(authority, pool_addr, template_rx, miner_address.clone(), solution_tx);
+    let server = Sv2Server::new(authority, pool_addr, template_rx, miner_address.clone(), solution_tx, None);
 
     tokio::spawn(async move {
         if let Err(e) = server.run().await {
@@ -174,7 +179,7 @@ async fn sv1_mine_block_through_translator() {
 
     // ── Start translator ─────────────────────────────────────────────────────
 
-    let mut translator = start_translator(POOL_PORT, &pub_key);
+    let mut translator = start_translator(POOL_PORT, SV1_PORT, ".translator-test.toml", &pub_key);
 
     // Give the translator time to start and check it didn't crash immediately.
     sleep(Duration::from_millis(500)).await;
@@ -384,6 +389,173 @@ async fn sv1_mine_block_through_translator() {
     // ── Cleanup ──────────────────────────────────────────────────────────────
 
     translator.kill().ok();
+}
+
+/// Verifies that `SubmitSharesSuccess` is not blocked by the DB worker.
+///
+/// Passes a "slow" db channel whose receiver sleeps 100 ms per event.
+/// The `mining.submit` round-trip must still complete well under that delay,
+/// proving the ACK path does not await the DB write.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn share_ack_does_not_block_on_db() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .try_init();
+
+    const ACK_POOL_PORT: u16 = 13336;
+    const ACK_SV1_PORT: u16 = 34256;
+    const DB_SLEEP_MS: u64 = 100;
+
+    // Slow DB: sleeps 100 ms per event.
+    let (slow_tx, slow_rx) = std::sync::mpsc::channel::<DbEvent>();
+    std::thread::spawn(move || {
+        while let Ok(_) = slow_rx.recv() {
+            std::thread::sleep(Duration::from_millis(DB_SLEEP_MS));
+        }
+    });
+
+    let rpc = regtest_client();
+    rpc.create_wallet("ack-latency-test").await.ok();
+    let wallet_rpc = RpcClient::with_wallet("http://127.0.0.1:18443", "pool", "poolpass", "ack-latency-test");
+    let miner_address = wallet_rpc.get_new_address().await.expect("get miner address");
+
+    let (pub_key, priv_key) = generate_keypair();
+    let authority = AuthorityKeypair { public: pub_key, private: priv_key };
+    let tp_pubkey = template_client::read_authority_pubkey(&datadir())
+        .expect("read sv2_authority_key — run `just start-all` first");
+    let (template_rx, solution_tx) = template_client::start(
+        "127.0.0.1:18447".parse().unwrap(),
+        tp_pubkey,
+        100,
+    )
+    .await
+    .expect("connect to sv2-tp");
+
+    let pool_addr: SocketAddr = format!("127.0.0.1:{ACK_POOL_PORT}").parse().unwrap();
+    let server = Sv2Server::new(
+        authority,
+        pool_addr,
+        template_rx,
+        miner_address.clone(),
+        solution_tx,
+        Some(slow_tx),
+    );
+    tokio::spawn(async move { let _ = server.run().await; });
+    wait_for_port(ACK_POOL_PORT).await;
+
+    let mut translator = start_translator(ACK_POOL_PORT, ACK_SV1_PORT, ".translator-ack-test.toml", &pub_key);
+    sleep(Duration::from_millis(500)).await;
+    if let Ok(Some(status)) = translator.try_wait() {
+        panic!("translator exited immediately: {status}");
+    }
+    wait_for_port(ACK_SV1_PORT).await;
+
+    // SV1 handshake.
+    let mut stream = std::net::TcpStream::connect(format!("127.0.0.1:{ACK_SV1_PORT}")).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+
+    send_line(&mut stream, &json!({"id": 1, "method": "mining.subscribe", "params": []}));
+    let mut sub_line = String::new();
+    reader.read_line(&mut sub_line).unwrap();
+    let sub: serde_json::Value = serde_json::from_str(sub_line.trim()).unwrap();
+    let extranonce1_hex = sub["result"][1].as_str().expect("extranonce1").to_string();
+    let extranonce2_size = sub["result"][2].as_u64().expect("extranonce2_size") as usize;
+
+    send_line(&mut stream, &json!({"id": 2, "method": "mining.authorize", "params": [&miner_address, ""]}));
+
+    let mut auth_ok = false;
+    let mut notify: Option<serde_json::Value> = None;
+    for _ in 0..20 {
+        let mut line = String::new();
+        if reader.read_line(&mut line).unwrap_or(0) == 0 { break; }
+        let msg: serde_json::Value = match serde_json::from_str(line.trim()) { Ok(v) => v, Err(_) => continue };
+        if msg["id"] == 2 { auth_ok = msg["result"].as_bool().unwrap_or(false); }
+        else if msg["method"] == "mining.notify" { notify = Some(msg); if auth_ok { break; } }
+    }
+    assert!(auth_ok, "authorize failed");
+    let notify = notify.expect("no notify");
+
+    // Build share from notify.
+    let params = &notify["params"];
+    let job_id = params[0].as_str().unwrap().to_string();
+    let prevhash_hex = params[1].as_str().unwrap();
+    let coinb1_hex = params[2].as_str().unwrap();
+    let coinb2_hex = params[3].as_str().unwrap();
+    let branches: Vec<String> = params[4].as_array().unwrap()
+        .iter().map(|v| v.as_str().unwrap().to_string()).collect();
+    let version   = u32::from_str_radix(params[5].as_str().unwrap(), 16).unwrap();
+    let nbits     = u32::from_str_radix(params[6].as_str().unwrap(), 16).unwrap();
+    let ntime     = u32::from_str_radix(params[7].as_str().unwrap(), 16).unwrap();
+
+    let prevhash_bytes = hex::decode(prevhash_hex).unwrap();
+    let mut prev_internal = [0u8; 32];
+    for i in 0..8 {
+        let g = &prevhash_bytes[i * 4..(i + 1) * 4];
+        prev_internal[i * 4] = g[3]; prev_internal[i * 4 + 1] = g[2];
+        prev_internal[i * 4 + 2] = g[1]; prev_internal[i * 4 + 3] = g[0];
+    }
+
+    let extranonce1 = hex::decode(&extranonce1_hex).unwrap();
+    let extranonce2 = vec![0u8; extranonce2_size];
+    let mut coinbase = hex::decode(coinb1_hex).unwrap();
+    coinbase.extend_from_slice(&extranonce1);
+    coinbase.extend_from_slice(&extranonce2);
+    coinbase.extend_from_slice(&hex::decode(coinb2_hex).unwrap());
+
+    let coinbase_tx: bitcoin::Transaction = bitcoin::consensus::deserialize(&coinbase).unwrap();
+    let mut hash: [u8; 32] = coinbase_tx.compute_txid().to_byte_array();
+    for branch_hex in &branches {
+        let sibling = hex::decode(branch_hex).unwrap();
+        let mut data = [0u8; 64]; data[..32].copy_from_slice(&hash); data[32..].copy_from_slice(&sibling);
+        hash = sha256d::Hash::hash(&data).to_byte_array();
+    }
+    let merkle_root = bitcoin::TxMerkleNode::from_byte_array(hash);
+
+    let target_hex = compact_to_target_hex(nbits);
+    let mut header = bitcoin::block::Header {
+        version: bitcoin::block::Version::from_consensus(version as i32),
+        prev_blockhash: bitcoin::BlockHash::from_byte_array(prev_internal),
+        merkle_root,
+        time: ntime,
+        bits: bitcoin::CompactTarget::from_consensus(nbits),
+        nonce: 0,
+    };
+    for nonce in 0..=u32::MAX {
+        header.nonce = nonce;
+        if header.block_hash().to_string() <= target_hex { break; }
+    }
+
+    // Submit and time the ACK.
+    let t = Instant::now();
+    send_line(&mut stream, &json!({
+        "id": 4, "method": "mining.submit",
+        "params": [&miner_address, job_id, hex::encode(&extranonce2),
+                   format!("{:08x}", header.time), format!("{:08x}", header.nonce)]
+    }));
+
+    // Read lines until we get the mining.submit response (id=4).
+    let deadline = Duration::from_millis(500);
+    let mut ack_elapsed = None;
+    for _ in 0..30 {
+        let mut line = String::new();
+        if reader.read_line(&mut line).unwrap_or(0) == 0 { break; }
+        if let Ok(msg) = serde_json::from_str::<serde_json::Value>(line.trim()) {
+            if msg["id"] == 4 {
+                ack_elapsed = Some(t.elapsed());
+                break;
+            }
+        }
+    }
+
+    translator.kill().ok();
+
+    let elapsed = ack_elapsed.expect("never received mining.submit response");
+    assert!(
+        elapsed < deadline,
+        "ACK took {elapsed:?} — expected < {deadline:?}. \
+         DB worker (sleeping {DB_SLEEP_MS} ms/event) must not block the response path."
+    );
 }
 
 /// Convert compact bits to a 32-byte big-endian target as a lowercase hex string.

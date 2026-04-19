@@ -42,6 +42,7 @@ use tokio::{net::TcpListener, sync::{mpsc, watch}};
 use tracing::{error, info, warn};
 
 use crate::{
+    db::{hash_to_difficulty, DbEvent, ShareEvent},
     jobs::{build_sv2_coinbase_from_tdp, script_from_address, SV2_EXTRANONCE2_SIZE, SV2_EXTRANONCE_TOTAL},
     noise_connection::{accept_noise, EitherFrame, NoiseWriteHalf},
     template_client::{RawTemplate, SubmitSolutionData},
@@ -135,6 +136,7 @@ pub struct Sv2Server {
     template_rx: watch::Receiver<RawTemplate>,
     pool_address: String,
     solution_tx: mpsc::Sender<SubmitSolutionData>,
+    db_tx: Option<std::sync::mpsc::Sender<DbEvent>>,
 }
 
 impl Sv2Server {
@@ -144,6 +146,7 @@ impl Sv2Server {
         template_rx: watch::Receiver<RawTemplate>,
         pool_address: String,
         solution_tx: mpsc::Sender<SubmitSolutionData>,
+        db_tx: Option<std::sync::mpsc::Sender<DbEvent>>,
     ) -> Self {
         Self {
             keypair: Arc::new(keypair),
@@ -151,6 +154,7 @@ impl Sv2Server {
             template_rx,
             pool_address,
             solution_tx,
+            db_tx,
         }
     }
 
@@ -170,10 +174,11 @@ impl Sv2Server {
             let template_rx = self.template_rx.clone();
             let pool_address = self.pool_address.clone();
             let solution_tx = self.solution_tx.clone();
+            let db_tx = self.db_tx.clone();
 
             tokio::spawn(async move {
                 if let Err(e) =
-                    handle_connection(stream, peer_addr, &keypair, template_rx, pool_address, solution_tx).await
+                    handle_connection(stream, peer_addr, &keypair, template_rx, pool_address, solution_tx, db_tx).await
                 {
                     warn!(%peer_addr, "Connection error: {e:#}");
                 }
@@ -191,6 +196,7 @@ async fn handle_connection(
     mut template_rx: watch::Receiver<RawTemplate>,
     pool_address: String,
     solution_tx: mpsc::Sender<SubmitSolutionData>,
+    db_tx: Option<std::sync::mpsc::Sender<DbEvent>>,
 ) -> Result<()> {
     let responder = keypair.to_responder()?;
     let role = HandshakeRole::Responder(responder);
@@ -218,16 +224,23 @@ async fn handle_connection(
                     }
                 };
                 let template = template_rx.borrow().clone();
-                if let Err(e) = dispatch_message(frame, &mut writer, &mut state, &template, peer_addr, &solution_tx).await {
+                if let Err(e) = dispatch_message(frame, &mut writer, &mut state, &template, peer_addr, &solution_tx, db_tx.as_ref()).await {
                     error!(%peer_addr, "Message error: {e:#}");
                     return Err(e);
                 }
             }
             Ok(()) = template_rx.changed() => {
                 let template = template_rx.borrow_and_update().clone();
-                info!(%peer_addr, "Template updated, broadcasting new jobs");
                 let job_id = state.next_job_id;
                 state.next_job_id += 1;
+                // Parse SetNewPrevHash for the log (best-effort).
+                {
+                    let mut b = template.set_new_prev_hash.clone();
+                    if let Ok(snph) = binary_sv2::from_bytes::<template_distribution_sv2::SetNewPrevHash<'_>>(&mut b) {
+                        let prev_hash = hex::encode(snph.prev_hash.inner_as_ref());
+                        info!(%peer_addr, job_id, prev_hash = %prev_hash, "new template — broadcasting job");
+                    }
+                }
                 if let Err(e) = send_jobs_to_all_channels(&mut writer, &mut state, &template, job_id).await {
                     error!(%peer_addr, "Error broadcasting jobs: {e:#}");
                 }
@@ -335,6 +348,7 @@ async fn dispatch_message(
     template: &RawTemplate,
     peer_addr: SocketAddr,
     solution_tx: &mpsc::Sender<SubmitSolutionData>,
+    db_tx: Option<&std::sync::mpsc::Sender<DbEvent>>,
 ) -> Result<()> {
     let sv2_frame = match frame {
         Frame::Sv2(f) => f,
@@ -345,10 +359,10 @@ async fn dispatch_message(
 
     match header.msg_type() {
         MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL => {
-            handle_open_extended_mining_channel(sv2_frame, writer, state, template, peer_addr).await
+            handle_open_extended_mining_channel(sv2_frame, writer, state, template, peer_addr, db_tx).await
         }
         MESSAGE_TYPE_SUBMIT_SHARES_EXTENDED => {
-            handle_submit_shares_extended(sv2_frame, writer, state, peer_addr, solution_tx).await
+            handle_submit_shares_extended(sv2_frame, writer, state, peer_addr, solution_tx, db_tx).await
         }
         other => {
             warn!(
@@ -369,6 +383,7 @@ async fn handle_open_extended_mining_channel(
     state: &mut ConnectionState,
     template: &RawTemplate,
     peer_addr: SocketAddr,
+    db_tx: Option<&std::sync::mpsc::Sender<DbEvent>>,
 ) -> Result<()> {
     let msg: OpenExtendedMiningChannel<'_> =
         binary_sv2::from_bytes(frame.payload())
@@ -429,7 +444,7 @@ async fn handle_open_extended_mining_channel(
     info!(%peer_addr, channel_id, "OpenExtendedMiningChannelSuccess sent");
 
     // Register the channel.
-    let channel = ChannelInfo { channel_id, extranonce_prefix, miner_address, current_job: None, channel_target_be };
+    let channel = ChannelInfo { channel_id, extranonce_prefix, miner_address: miner_address.clone(), current_job: None, channel_target_be };
     state.channels.insert(channel_id, channel);
 
     // Send the first job immediately.
@@ -448,6 +463,15 @@ async fn handle_open_extended_mining_channel(
         .context("send SetNewPrevHash")?;
 
     info!(%peer_addr, channel_id, job_id, "Initial job sent");
+
+    if let Some(tx) = db_tx {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let _ = tx.send(DbEvent::MinerConnected { address: miner_address.clone(), timestamp: now });
+    }
+
     Ok(())
 }
 
@@ -597,7 +621,10 @@ async fn handle_submit_shares_extended(
     state: &mut ConnectionState,
     peer_addr: SocketAddr,
     solution_tx: &mpsc::Sender<SubmitSolutionData>,
+    db_tx: Option<&std::sync::mpsc::Sender<DbEvent>>,
 ) -> Result<()> {
+    let ack_timer = std::time::Instant::now();
+
     let share: SubmitSharesExtended<'_> =
         binary_sv2::from_bytes(frame.payload())
             .map_err(|e| anyhow::anyhow!("SubmitSharesExtended parse error: {e:?}"))?;
@@ -681,7 +708,14 @@ async fn handle_submit_shares_extended(
 
     // Block-level solution: propagate to sv2-tp.
     if block_hash <= network_target_hex {
-        info!(%peer_addr, channel_id, "Block-level share! Sending SubmitSolution");
+        info!(
+            %peer_addr,
+            channel_id,
+            block_hash = %block_hash,
+            miner = %channel.miner_address,
+            template_id = job.template_id,
+            "BLOCK FOUND — submitting solution to sv2-tp"
+        );
         let _ = solution_tx.send(SubmitSolutionData {
             template_id: job.template_id,
             version: share.version,
@@ -701,6 +735,27 @@ async fn handle_submit_shares_extended(
         .write_sv2_message(success, MESSAGE_TYPE_SUBMIT_SHARES_SUCCESS, true)
         .await
         .context("send SubmitSharesSuccess")?;
+
+    tracing::debug!(
+        %peer_addr,
+        channel_id,
+        ack_us = ack_timer.elapsed().as_micros(),
+        "share ACK sent"
+    );
+
+    // Compute block hash in big-endian (same order as channel target) for DB storage.
+    let hash_internal = header.block_hash().to_byte_array();
+    let mut hash_be = hash_internal;
+    hash_be.reverse();
+
+    if let Some(tx) = db_tx {
+        let _ = tx.send(DbEvent::Share(ShareEvent {
+            miner_address: channel.miner_address.clone(),
+            difficulty: hash_to_difficulty(&hash_be),
+            block_hash_be: hash_be,
+            timestamp: share.ntime as i64,
+        }));
+    }
 
     Ok(())
 }

@@ -36,3 +36,4 @@ common_messages_sv2    = "7.0.0"
 template_distribution_sv2 = "5.0.0"
 async-channel          = "1.8"
 secp256k1              = { version = "0.29", features = ["rand-std"] }
+rusqlite               = { version = "0.32", features = ["bundled"] }

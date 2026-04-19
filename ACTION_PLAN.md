@@ -105,16 +105,64 @@ Using extended channels, miners (via translator) send `SubmitSharesExtended`.
 - [x] analizar https://github.com/warioishere/blitzpool, ver que podemos aprender de ella y aplicarlo
 
 ## Paso 6 — Persistencia básica
-- [ ] SQLite con sqlx
-- [ ] Tabla `miners` (dirección BTC, primera conexión)
-- [ ] Tabla `shares` (miner, dificultad, timestamp, epoch)
-- [ ] Tabla `epoch_best` (mejor share por miner por epoch)
+- [x] SQLite con `rusqlite` (bundled, sin Redis ni sqlx)
+- [x] Tabla `miners` (dirección BTC, primera conexión)
+- [x] Tabla `shares` (miner_address, difficulty, block_hash_be, timestamp)
+- [x] Tabla `epoch_stats` (miner_address, shares_count, total_difficulty, best_share_hash) — epoch_number se añade en Paso 8
+- [x] Tabla `competition_entries` (miner_address, entry_paid_sats, entry_timestamp, ark_address) — epoch_number se añade en Paso 8
+- [x] En el hot path: ACK al miner primero, `Sender::send()` no bloqueante tras el write — DB nunca bloquea el ACK
+- [x] `DbWorker` acumula en `Vec` en memoria; flush cada 60 s con una sola transacción SQLite (batch INSERT + upsert epoch_stats)
+- [x] `best_share_hash` se actualiza sólo cuando el nuevo hash es menor (mejor) que el actual — comparación BLOB en SQLite
+- [x] `tracing::debug!(ack_us = ...)` en el hot path de share validation
+- [x] Test `share_ack_does_not_block_on_db` en `tests/sv1_miner.rs`: DB artificial de 100 ms/evento, assert ACK < 500 ms
 
-## Paso 7 — Integración end-to-end
+## Paso 7 — Medición de hashrate
+- [x] En `stratum_sv2.rs`: al aceptar share válido, enviar `DbEvent::Share(miner_address, difficulty, timestamp)` — ya fluye por el canal del Paso 6
+- [ ] En `DbWorker`: acumular shares por ventanas de 1 minuto por address (`HashMap<String, f64>`)
+- [ ] Cada minuto: `epoch_stats.active_minutes++` + acumular `total_difficulty` en el flush batch
+- [ ] `hashrate = Σ(share_difficulty) * 2^32 / 60` (misma fórmula que blitzpool)
+- [ ] API interna (función pública en `db`): hashrate actual por address (últimos N minutos), hashrate pool total
+
+## Paso 8 — Competición por época (Bitaxe League)
+
+### Modelo de negocio
+- Mineros **free**: minan normal, coinbase a su dirección, sin acceso a competición
+- Mineros **competitor**: pagan 5 000 sats de entrada → compiten en la **siguiente** época
+- Premio: suma de todas las entradas menos comisión arbitraria de la pool
+- Pago: ARK (almacenar dirección ARK del ganador; lógica de pago posterior)
+
+### Épocas
+- Época = 2016 bloques de Bitcoin (ajuste de dificultad estándar)
+- Número de época derivado de `block_height / 2016`
+- Al inicio de cada época: los competitors que pagaron en la anterior quedan activados
+
+### Reglas de elegibilidad para ganar
+- Activo ≥ 90 % de la época: `active_minutes >= 0.9 * epoch_duration_minutes`
+  (anti-cheat: no vale minar con dificultad altísima 5 min y apagarse)
+- Hashrate dentro del rango Bitaxe/NerdAxe: cap superior ~equivalente a un OctaXe
+  (el número exacto se fija después; la lógica de comprobación ya debe existir)
+- Hashrate mínimo: debe superar un umbral mínimo de actividad real
+
+### Determinación del ganador
+- Ganador = competitor elegible con mayor `best_difficulty` en la época
+  (`best_difficulty` = dificultad del mejor share individual enviado)
+- En caso de empate exacto: primer share en tiempo gana
+
+### Tablas adicionales
+- `competition_entries`: registra la inscripción (epoch_number, miner_address, ark_address, paid_sats)
+- `epoch_stats` ya cubre el tracking de actividad y best_difficulty por miner por época
+
+### Lo que queda fuera de este paso (futuro)
+- [ ] Cobro real de los 5 000 sats (Lightning / ARK on-chain)
+- [ ] Pago automático al ganador via ARK
+- [ ] Frontend/API pública con leaderboard
+
+## Paso 9 — Integración end-to-end
 - [ ] Stack completo en local: bitcoind + bitcoin-core-sv2 + nuestra pool + translator
 - [ ] Conectar Bitaxe real (o simulado) al translator
 - [ ] Verificar que recibe jobs y envía shares válidos a través del stack completo
 - [ ] Verificar que un bloque encontrado en regtest se propaga a Core
+- [ ] Simular una época completa con varios miners (free + competitor) y verificar ganador
 
 ---
 
@@ -123,10 +171,10 @@ Using extended channels, miners (via translator) send `SubmitSharesExtended`.
 Puntos extraídos del análisis del fork JS de public-pool. No son pasos bloqueantes, aplicar cuando
 corresponda según la fase en curso.
 
-### Latencia de respuesta a shares
-Enviar `SubmitSharesSuccess` antes de cualquier `await` (escrituras a DB, estadísticas, etc.).
-blitzpool escribe el ACK al socket sin `await` y lanza el trabajo async de contabilidad después.
-En `stratum_sv2.rs`, el `SubmitSharesSuccess` debe salir al wire antes de tocar SQLite (Paso 6).
+### Latencia de respuesta a shares ✓ implementado en Paso 6
+`SubmitSharesSuccess` sale al wire antes de cualquier operación de DB. El evento de share
+se envía por `std::sync::mpsc::Sender::send()` (no bloqueante) tras el ACK. Test de regresión:
+`share_ack_does_not_block_on_db` en `sv1_miner.rs`.
 
 ### TCP_NODELAY explícito
 blitzpool llama `socket.setNoDelay(true)` en el momento del accept, antes de detectar protocolo.
@@ -259,10 +307,6 @@ En nuestra validación SV2: el `ntime` del `SubmitSharesExtended` debe estar den
 rango razonable respecto al `prev_hash` del template activo. Ya lo tenemos implícito (job
 desaparece tras 90 s), pero conviene validarlo explícitamente.
 
-### Batch de inserts en DB y throttle de heartbeat
-
-public-pool acumula inserts de clientes nuevos en cola y los persiste cada 5 s
-(`client.service.ts:25`). Los updates de estadísticas sólo van a DB cada 60 s
-(`StratumV1ClientStatistics.ts:93`), no en cada share.
-Aplicar en Paso 6: nunca hacer un INSERT/UPDATE síncrono en el hot path de validación de share.
-Usar un canal `mpsc` para mandar eventos al worker de DB y devolver el ACK al miner sin esperar.
+### Batch de inserts en DB ✓ implementado en Paso 6
+`DbWorker` acumula eventos en `Vec` en memoria y hace un único `BEGIN/COMMIT` cada 60 s.
+Nunca hay INSERT síncrono en el hot path.

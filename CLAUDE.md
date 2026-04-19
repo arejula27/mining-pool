@@ -112,7 +112,9 @@ Bitcoin node config is in `bitcoin/bitcoin.conf` (tracked in git, regtest). Bloc
 
 - **`template_client`** — SV2 Template Distribution Protocol client. Connects to sv2-tp (default `127.0.0.1:18447`), completes the Noise initiator handshake, sends `SetupConnection` + `CoinbaseOutputConstraints`, and receives `NewTemplate` + `SetNewPrevHash`. Broadcasts templates over a `tokio::sync::watch` channel and accepts `SubmitSolution` via an `mpsc::Sender`.
 
-- **`stratum_sv2`** — SV2 Mining Protocol server. TCP listener with Noise NX responder handshake per connection. Handles `SetupConnection`, `OpenExtendedMiningChannel`, and `SubmitShares`. Sends `NewExtendedMiningJob` and `SetNewPrevHash` to connected channels when a new template arrives.
+- **`stratum_sv2`** — SV2 Mining Protocol server. TCP listener with Noise NX responder handshake per connection. Handles `SetupConnection`, `OpenExtendedMiningChannel`, and `SubmitShares`. Sends `NewExtendedMiningJob` and `SetNewPrevHash` to connected channels when a new template arrives. Accepts `Option<std::sync::mpsc::Sender<DbEvent>>` to emit share and miner-connected events to the DB worker without blocking the ACK path.
+
+- **`db`** — SQLite persistence (via `rusqlite`). `DbWorker::start(path)` opens the database and spawns a background `std::thread` that batches `DbEvent`s and flushes every 60 s in a single transaction. Tables: `miners`, `shares`, `epoch_stats` (best share hash per miner), `competition_entries`. The hot path never awaits the DB — it calls `Sender::send()` (non-blocking) after the ACK is already on the wire.
 
 - **`noise_connection`** — Thin helpers around `noise_sv2` and `codec_sv2`: `connect_noise` completes either initiator or responder handshake and returns typed read/write halves.
 

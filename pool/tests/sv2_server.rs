@@ -123,7 +123,7 @@ async fn sv2_server_open_extended_channel() {
     .expect("connect to sv2-tp");
 
     let listen_addr: SocketAddr = format!("127.0.0.1:{SV2_TEST_PORT}").parse().unwrap();
-    let server = Sv2Server::new(authority, listen_addr, template_rx, pool_addr, solution_tx);
+    let server = Sv2Server::new(authority, listen_addr, template_rx, pool_addr, solution_tx, None);
 
     tokio::spawn(async move {
         if let Err(e) = server.run().await {
