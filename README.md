@@ -14,11 +14,8 @@ Bitaxe/NerdAxe (SV1)
   translator_sv2         <- sv2-apps binary, unmodified
        |  SV2 Mining Protocol + Noise
        v
-  pool                   <- this binary
-       |  SV2 Template Distribution Protocol
-       v
-  sv2-tp                 <- sv2-apps binary, unmodified
-       |
+      pool                   <- this binary
+       | IPC
        v
   Bitcoin Core (regtest / mainnet)
 ```
@@ -52,13 +49,12 @@ Miners that support Stratum V2 natively connect directly to the pool.
 | Binary | Source | Role |
 |---|---|---|
 | `bitcoin-node` | Bitcoin Core with SV2 patch | Full node + block validation |
-| `sv2-tp` | sv2-apps | Template Distribution Protocol provider |
 | `pool` | this repository | SV2 Mining Protocol server |
 
 **Start:**
 
 ```
-just start-all   # starts bitcoin-node and sv2-tp
+just start-all   # starts bitcoin-node
 just run         # starts the pool (port 3333)
 ```
 
@@ -81,14 +77,13 @@ Devices that only speak Stratum V1 (such as Bitaxe and NerdAxe running ESP-Miner
 | Binary | Source | Role |
 |---|---|---|
 | `bitcoin-node` | Bitcoin Core with SV2 patch | Full node + block validation |
-| `sv2-tp` | sv2-apps | Template Distribution Protocol provider |
 | `pool` | this repository | SV2 Mining Protocol server |
 | `translator_sv2` | sv2-apps | SV1 to SV2 translation proxy |
 
 **Start:**
 
 ```
-just start-all        # starts bitcoin-node and sv2-tp
+just start-all        # starts bitcoin-node
 just run &            # starts the pool (port 3333)
 just start-translator # starts the translator (port 34255)
 ```
