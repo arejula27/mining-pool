@@ -118,10 +118,10 @@ Using extended channels, miners (via translator) send `SubmitSharesExtended`.
 
 ## Paso 7 — Medición de hashrate
 - [x] En `stratum_sv2.rs`: al aceptar share válido, enviar `DbEvent::Share(miner_address, difficulty, timestamp)` — ya fluye por el canal del Paso 6
-- [ ] En `DbWorker`: acumular shares por ventanas de 1 minuto por address (`HashMap<String, f64>`)
-- [ ] Cada minuto: `epoch_stats.active_minutes++` + acumular `total_difficulty` en el flush batch
-- [ ] `hashrate = Σ(share_difficulty) * 2^32 / 60` (misma fórmula que blitzpool)
-- [ ] API interna (función pública en `db`): hashrate actual por address (últimos N minutos), hashrate pool total
+- [x] En `DbWorker`: acumular shares por ventanas de 1 minuto por address (`HashMap<String, f64>`)
+- [x] Cada minuto: `epoch_stats.active_minutes++` + insertar en `minute_hashrates` en el flush batch; pruning de rows > 24 h
+- [x] `hashrate = Σ(share_difficulty) * 2^32 / window_seconds` (misma fórmula que blitzpool)
+- [x] API interna (`DbReader`): `hashrate_for_address(address, lookback_minutes)`, `pool_hashrate(lookback_minutes)` — WAL mode, read-only connection
 
 ## Paso 8 — Competición por época (Bitaxe League)
 
