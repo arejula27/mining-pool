@@ -1,12 +1,12 @@
-//! End-to-end block mining test via the Template Distribution Protocol.
+//! End-to-end block mining test via direct Bitcoin Core IPC.
 //!
 //! Flow:
-//!   sv2-tp ──NewTemplate/SetNewPrevHash──▶ pool (template_client)
+//!   node_ipc ──NewTemplate/SetNewPrevHash──▶ pool
 //!   pool builds coinbase, mines nonce
-//!   pool ──SubmitSolution──▶ sv2-tp ──submitblock──▶ bitcoin-core
+//!   pool ──SubmitSolution──▶ Bitcoin Core via IPC
 //!   assert block height increased
 //!
-//! Requires `just start-all` (bitcoind + sv2-tp) to be running.
+//! Requires `just start` (bitcoind) to be running.
 //! Run with: `just int-mine`
 
 use std::time::Duration;
@@ -19,26 +19,22 @@ use bitcoin::{
 };
 use pool::{
     jobs::{build_sv2_coinbase_from_tdp, script_from_address, SV2_EXTRANONCE_TOTAL},
+    node_ipc::{self, SubmitSolutionData},
     rpc::RpcClient,
-    template_client::{self, SubmitSolutionData},
 };
-use template_distribution_sv2::{NewTemplate, SetNewPrevHash};
 
-fn datadir() -> String {
+fn ipc_socket() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .unwrap()
-        .join(".bitcoin-data")
-        .to_string_lossy()
-        .into_owned()
+        .join(".bitcoin-data/regtest/node.sock")
 }
 
 fn regtest_client() -> RpcClient {
     RpcClient::new("http://127.0.0.1:18443", "pool", "poolpass")
 }
 
-/// Convert compact bits to a 32-byte big-endian target as a lowercase hex string,
-/// matching the format of `header.block_hash().to_string()` for lexicographic comparison.
+/// Convert compact bits to a 32-byte big-endian target as a lowercase hex string.
 fn compact_to_target_hex(bits: u32) -> String {
     let exp = (bits >> 24) as usize;
     let mantissa = bits & 0x007f_ffff;
@@ -56,30 +52,13 @@ fn compact_to_target_hex(bits: u32) -> String {
 async fn mine_block_from_sv2_template() {
     let client = regtest_client();
 
-    // ── Connect to sv2-tp ────────────────────────────────────────────────────
-
-    let pub_key = template_client::read_authority_pubkey(&datadir())
-        .expect("read sv2_authority_key — run `just start-all` first");
-
-    let (template_rx, solution_tx) = template_client::start(
-        "127.0.0.1:18447".parse().unwrap(),
-        pub_key,
-        100,
-    )
-    .await
-    .expect("connect to sv2-tp");
+    let (template_rx, solution_tx) = node_ipc::start(&ipc_socket(), 100)
+        .await
+        .expect("connect to Bitcoin Core IPC — run `just start` first");
 
     let raw = template_rx.borrow().clone();
-
-    // ── Parse TDP messages ───────────────────────────────────────────────────
-
-    let mut nt_bytes = raw.new_template.clone();
-    let mut snph_bytes = raw.set_new_prev_hash.clone();
-
-    let nt: NewTemplate<'_> = binary_sv2::from_bytes(&mut nt_bytes)
-        .unwrap_or_else(|e| panic!("parse NewTemplate: {e:?}"));
-    let snph: SetNewPrevHash<'_> = binary_sv2::from_bytes(&mut snph_bytes)
-        .unwrap_or_else(|e| panic!("parse SetNewPrevHash: {e:?}"));
+    let nt = &raw.new_template;
+    let snph = &raw.set_new_prev_hash;
 
     // ── Build coinbase from TDP data ─────────────────────────────────────────
 
@@ -104,13 +83,11 @@ async fn mine_block_from_sv2_template() {
     coinbase_bytes.extend_from_slice(&[0u8; SV2_EXTRANONCE_TOTAL]);
     coinbase_bytes.extend_from_slice(&parts.coinb2);
 
-    // Verify it parses as a valid transaction.
     let coinbase_tx: bitcoin::Transaction = deserialize(&coinbase_bytes)
         .expect("coinbase must be a valid Bitcoin transaction");
     assert!(coinbase_tx.input[0].previous_output.is_null());
 
     // ── Compute merkle root ──────────────────────────────────────────────────
-    // Block header merkle root uses TXIDs (non-witness hash), not wTXIDs.
 
     let mut hash: [u8; 32] = coinbase_tx.compute_txid().to_byte_array();
     for sibling in nt.merkle_path.inner_as_ref() {
@@ -145,7 +122,7 @@ async fn mine_block_from_sv2_template() {
         }
     }
 
-    // ── Submit via SubmitSolution → sv2-tp reconstructs and submits block ────
+    // ── Submit solution directly to Bitcoin Core via IPC ─────────────────────
 
     let height_before = client.get_block_count().await.unwrap();
 
@@ -160,7 +137,6 @@ async fn mine_block_from_sv2_template() {
         .await
         .expect("send SubmitSolution");
 
-    // Give sv2-tp time to reconstruct and submit the block to bitcoin-core.
     tokio::time::sleep(Duration::from_secs(2)).await;
 
     let height_after = client.get_block_count().await.unwrap();

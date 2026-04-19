@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use std::{env, net::SocketAddr};
+use std::{env, net::SocketAddr, path::PathBuf};
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -13,10 +13,8 @@ pub struct Config {
     pub pool_authority_public_key: [u8; 32],
     /// Pool authority private key for the Noise NX handshake (32 bytes, hex).
     pub pool_authority_private_key: [u8; 32],
-    /// Address of the sv2-tp Template Provider (default 127.0.0.1:18447 for regtest).
-    pub tp_addr: SocketAddr,
-    /// Path to the Bitcoin Core data directory (used to load the sv2-tp authority key).
-    pub bitcoin_datadir: String,
+    /// Path to the Bitcoin Core IPC UNIX socket (e.g. .bitcoin-data/regtest/node.sock).
+    pub bitcoin_ipc_socket: PathBuf,
 }
 
 impl Config {
@@ -33,12 +31,10 @@ impl Config {
             pool_address: env::var("POOL_ADDRESS").context("POOL_ADDRESS not set")?,
             pool_authority_public_key: parse_key32("POOL_AUTHORITY_PUBLIC_KEY")?,
             pool_authority_private_key: parse_key32("POOL_AUTHORITY_PRIVATE_KEY")?,
-            tp_addr: env::var("TEMPLATE_PROVIDER_ADDR")
-                .unwrap_or_else(|_| "127.0.0.1:18447".to_string())
-                .parse()
-                .context("TEMPLATE_PROVIDER_ADDR must be a valid socket address")?,
-            bitcoin_datadir: env::var("BITCOIN_DATADIR")
-                .unwrap_or_else(|_| ".bitcoin-data".to_string()),
+            bitcoin_ipc_socket: PathBuf::from(
+                env::var("BITCOIN_IPC_SOCKET")
+                    .unwrap_or_else(|_| ".bitcoin-data/regtest/node.sock".to_string()),
+            ),
         })
     }
 }

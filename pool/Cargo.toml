@@ -37,3 +37,9 @@ template_distribution_sv2 = "5.0.0"
 async-channel          = "1.8"
 secp256k1              = { version = "0.29", features = ["rand-std"] }
 rusqlite               = { version = "0.32", features = ["bundled"] }
+
+# Bitcoin Core IPC (Cap'n Proto over UNIX socket)
+bitcoin-capnp-types    = "0.1.0"
+capnp                  = "0.21"
+capnp-rpc              = "0.21"
+tokio-util             = { version = "0.7", features = ["compat"] }

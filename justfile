@@ -1,11 +1,9 @@
 data_dir            := justfile_directory() / ".bitcoin-data"
 conf                := justfile_directory() / "bitcoin" / "bitcoin.conf"
-sv2_tp_conf         := justfile_directory() / "bitcoin" / "sv2-tp.conf"
 translator_conf_tmpl := justfile_directory() / "bitcoin" / "translator.toml"
 translator_conf_rt  := justfile_directory() / ".translator-runtime.toml"
 cli                 := "bitcoin-cli -datadir=" + data_dir
 pid_file            := justfile_directory() / ".bitcoin-node.pid"
-sv2_tp_pid          := justfile_directory() / ".sv2-tp.pid"
 translator_pid      := justfile_directory() / ".translator.pid"
 
 # List all available recipes
@@ -14,7 +12,7 @@ default:
 
 # ── Node ──────────────────────────────────────────────────────────────────────
 
-# Start bitcoin-node in the background (IPC socket for sv2-tp, RPC for tests)
+# Start bitcoin-node in the background (IPC socket for pool, RPC for tests)
 start:
     #!/usr/bin/env bash
     if ! command -v bitcoin-node &>/dev/null; then
@@ -56,35 +54,6 @@ mine n="1":
 reset-chain:
     rm -rf {{data_dir}}/regtest
 
-# ── sv2-tp ────────────────────────────────────────────────────────────────────
-
-# Start sv2-tp in the background (requires bitcoin-node already running)
-start-sv2-tp:
-    #!/usr/bin/env bash
-    if ! command -v sv2-tp &>/dev/null; then
-        echo "sv2-tp not found — run from inside nix develop" >&2
-        exit 1
-    fi
-    nohup sv2-tp -datadir={{data_dir}} -conf={{sv2_tp_conf}} \
-        > {{data_dir}}/sv2-tp.log 2>&1 &
-    echo $! > {{sv2_tp_pid}}
-    echo "Waiting for sv2-tp on :18447..."
-    until ss -tlnp 2>/dev/null | grep -q 18447; do sleep 0.5; done
-    echo "sv2-tp ready"
-
-# Stop sv2-tp
-stop-sv2-tp:
-    @if [ -f {{sv2_tp_pid}} ]; then kill $(cat {{sv2_tp_pid}}) 2>/dev/null || true; rm -f {{sv2_tp_pid}}; fi
-
-# Force-kill sv2-tp
-kill-sv2-tp:
-    @if [ -f {{sv2_tp_pid}} ]; then kill $(cat {{sv2_tp_pid}}) 2>/dev/null || true; rm -f {{sv2_tp_pid}}; fi
-    pkill sv2-tp || true
-
-# Run sv2-tp in the foreground (for manual use / debugging)
-sv2-tp:
-    sv2-tp -datadir={{data_dir}} -conf={{sv2_tp_conf}}
-
 # ── Translator ────────────────────────────────────────────────────────────────
 
 # Start the SV1↔SV2 translator (requires pool already running on :3333)
@@ -120,14 +89,14 @@ kill-translator:
 
 # ── Full environment ──────────────────────────────────────────────────────────
 
-# Start bitcoin-node and sv2-tp (full environment, without translator)
-start-all: start start-sv2-tp
+# Start bitcoin-node (alias kept for backwards compatibility with scripts)
+start-all: start
 
-# Stop sv2-tp then bitcoin-node
-stop-all: stop-sv2-tp stop
+# Stop bitcoin-node
+stop-all: stop
 
 # Force-kill everything
-kill-all: kill-translator kill-sv2-tp kill
+kill-all: kill-translator kill
 
 # ── Pool ──────────────────────────────────────────────────────────────────────
 
@@ -156,20 +125,34 @@ unit:
     cargo test --manifest-path pool/Cargo.toml --lib -- --test-threads=1
 
 # Run all integration tests (starts and stops the full environment)
+# Each IPC-using suite gets a fresh node because Bitcoin Core v30.2 shuts down
+# when any IPC client disconnects (fixed in unreleased PR #33676).
 test-integration:
     #!/usr/bin/env bash
-    just start-all || exit 1
-    just mine 1
-    cargo test --manifest-path pool/Cargo.toml \
-        --test rpc \
-        --test template_client \
-        --test mine_block \
-        --test sv2_server \
-        --test sv1_miner \
-        -- --nocapture --test-threads=1
-    EXIT=$?
-    just stop-all
-    exit $EXIT
+    set -e
+
+    restart() {
+        just stop 2>/dev/null || true
+        just start
+        just mine 1
+    }
+
+    FAIL=0
+
+    restart
+    cargo test --manifest-path pool/Cargo.toml --test rpc -- --nocapture --test-threads=1 || FAIL=$?
+
+    restart
+    cargo test --manifest-path pool/Cargo.toml --test mine_block -- --nocapture --test-threads=1 || FAIL=$?
+
+    restart
+    cargo test --manifest-path pool/Cargo.toml --test sv2_server -- --nocapture --test-threads=1 || FAIL=$?
+
+    restart
+    cargo test --manifest-path pool/Cargo.toml --test sv1_miner -- --nocapture --test-threads=1 || FAIL=$?
+
+    just stop 2>/dev/null || true
+    exit $FAIL
 alias int := test-integration
 
 # Run only the RPC integration tests (bitcoin-node only, no sv2-tp)
@@ -182,17 +165,6 @@ test-integration-rpc:
     exit $EXIT
 alias int-rpc := test-integration-rpc
 
-# Run only the template-client integration tests (full environment required)
-test-integration-tdp:
-    #!/usr/bin/env bash
-    just start-all || exit 1
-    just mine 1
-    cargo test --manifest-path pool/Cargo.toml --test template_client -- --nocapture --test-threads=1
-    EXIT=$?
-    just stop-all
-    exit $EXIT
-alias int-tdp := test-integration-tdp
-
 # Run only the mine_block end-to-end test (full environment required)
 test-integration-mine:
     #!/usr/bin/env bash
@@ -204,13 +176,13 @@ test-integration-mine:
     exit $EXIT
 alias int-mine := test-integration-mine
 
-# Run the sv1_miner end-to-end test (starts bitcoin-node + sv2-tp, pool and translator are spawned by the test)
+# Run the sv1_miner end-to-end test (starts bitcoin-node, pool and translator are spawned by the test)
 test-integration-sv1:
     #!/usr/bin/env bash
     just stop-all 2>/dev/null || true
     pkill translator_sv2 2>/dev/null || true
     just reset-chain
-    just start-all || exit 1
+    just start || exit 1
     just mine 1
     cargo test --manifest-path pool/Cargo.toml --test sv1_miner -- --nocapture --test-threads=1
     EXIT=$?

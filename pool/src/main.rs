@@ -1,8 +1,8 @@
 use pool::{
     config::Config,
     db::DbWorker,
+    node_ipc,
     stratum_sv2::{AuthorityKeypair, Sv2Server},
-    template_client,
 };
 
 #[tokio::main]
@@ -13,9 +13,8 @@ async fn main() -> anyhow::Result<()> {
 
     let db_worker = DbWorker::start("pool.db")?;
 
-    let authority_pubkey = template_client::read_authority_pubkey(&cfg.bitcoin_datadir)?;
-    let (template_rx, solution_tx) = template_client::start(cfg.tp_addr, authority_pubkey, 100).await?;
-    tracing::info!("Connected to sv2-tp at {}", cfg.tp_addr);
+    let (template_rx, solution_tx) = node_ipc::start(&cfg.bitcoin_ipc_socket, 100).await?;
+    tracing::info!("Connected to Bitcoin Core IPC at {}", cfg.bitcoin_ipc_socket.display());
 
     let keypair = AuthorityKeypair {
         public: cfg.pool_authority_public_key,

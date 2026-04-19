@@ -38,46 +38,6 @@
 					'';
 				};
 
-				# SV2 Template Provider — pre-built binary from GitHub releases.
-				# Connects to bitcoin-node via IPC and serves the Template Distribution
-				# Protocol to our pool on port 8442.
-				# Only available for x86_64-linux (the primary dev platform).
-				sv2-tp = pkgs.stdenv.mkDerivation {
-					pname = "sv2-tp";
-					version = "1.0.3";
-
-					src = pkgs.fetchurl {
-						url = "https://github.com/stratum-mining/sv2-tp/releases/download/v1.0.3/sv2-tp-1.0.3-x86_64-linux-gnu.tar.gz";
-						hash = "sha256-NkLVTev2DnN88oKzRuXlU5wuEgkz/U2GTFWmkOeJzXg=";
-					};
-
-					# Patch the ELF interpreter and RPATH so the binary runs inside the
-					# Nix sandbox without relying on /lib64/ld-linux-x86-64.so.2.
-					nativeBuildInputs = [ pkgs.autoPatchelfHook ];
-					# libgcc_s.so.1 comes from stdenv.cc.cc.lib; glibc is provided by stdenv.
-					buildInputs = [ pkgs.stdenv.cc.cc.lib ];
-
-					# The tarball extracts files at its root (no top-level directory),
-					# so unpack manually into a subdirectory and point sourceRoot at it
-					# so nix cds into it before running subsequent phases.
-					unpackPhase = ''
-						runHook preUnpack
-						mkdir unpacked
-						tar -xzf "$src" -C unpacked
-						sourceRoot="unpacked/sv2-tp-1.0.3"
-						runHook postUnpack
-					'';
-
-					installPhase = ''
-						runHook preInstall
-						mkdir -p "$out/bin"
-						cp bin/sv2-tp "$out/bin/sv2-tp"
-						runHook postInstall
-					'';
-
-					meta.platforms = [ "x86_64-linux" ];
-				};
-
 				# SV2 Translator — bridges SV1 miners (Bitaxe/NerdAxe) to our SV2 pool.
 				# Statically linked musl binary; no ELF patching needed.
 				translator-sv2 = pkgs.stdenv.mkDerivation {
@@ -117,9 +77,6 @@
 
 						# Bitcoin Core (v30.2) — bitcoin-cli + bitcoin-node (IPC-enabled)
 						bitcoin-core
-
-						# SV2 Template Provider
-						sv2-tp
 
 						# SV2 Translator (SV1↔SV2 bridge)
 						translator-sv2

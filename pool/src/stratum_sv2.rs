@@ -37,7 +37,6 @@ use mining_sv2::{
     MESSAGE_TYPE_SUBMIT_SHARES_SUCCESS,
 };
 use noise_sv2::Responder;
-use template_distribution_sv2::NewTemplate;
 use tokio::{net::TcpListener, sync::{mpsc, watch}};
 use tracing::{error, info, warn};
 
@@ -45,7 +44,7 @@ use crate::{
     db::{hash_to_difficulty, DbEvent, ShareEvent},
     jobs::{build_sv2_coinbase_from_tdp, script_from_address, SV2_EXTRANONCE2_SIZE, SV2_EXTRANONCE_TOTAL},
     noise_connection::{accept_noise, EitherFrame, NoiseWriteHalf},
-    template_client::{RawTemplate, SubmitSolutionData},
+    node_ipc::{RawTemplate, SubmitSolutionData},
 };
 
 // ── Pool authority keypair ────────────────────────────────────────────────────
@@ -233,13 +232,9 @@ async fn handle_connection(
                 let template = template_rx.borrow_and_update().clone();
                 let job_id = state.next_job_id;
                 state.next_job_id += 1;
-                // Parse SetNewPrevHash for the log (best-effort).
                 {
-                    let mut b = template.set_new_prev_hash.clone();
-                    if let Ok(snph) = binary_sv2::from_bytes::<template_distribution_sv2::SetNewPrevHash<'_>>(&mut b) {
-                        let prev_hash = hex::encode(snph.prev_hash.inner_as_ref());
-                        info!(%peer_addr, job_id, prev_hash = %prev_hash, "new template — broadcasting job");
-                    }
+                    let prev_hash = hex::encode(template.set_new_prev_hash.prev_hash.inner_as_ref());
+                    info!(%peer_addr, job_id, prev_hash = %prev_hash, "new template — broadcasting job");
                 }
                 if let Err(e) = send_jobs_to_all_channels(&mut writer, &mut state, &template, job_id).await {
                     error!(%peer_addr, "Error broadcasting jobs: {e:#}");
@@ -408,13 +403,10 @@ async fn handle_open_extended_mining_channel(
     // Compute per-channel share target from the miner's declared hashrate,
     // clamped so it is never harder than the current network target.
     let mut channel_target_be = hashrate_to_target_be(nominal_hash_rate);
-    let mut snph_bytes = template.set_new_prev_hash.clone();
-    if let Ok(snph) = binary_sv2::from_bytes::<template_distribution_sv2::SetNewPrevHash<'_>>(&mut snph_bytes) {
-        let network_target_be = compact_to_target_be(snph.n_bits);
-        // A larger target means easier; use max so we never reject block-winning shares.
-        if network_target_be > channel_target_be {
-            channel_target_be = network_target_be;
-        }
+    let network_target_be = compact_to_target_be(template.set_new_prev_hash.n_bits);
+    // A larger target means easier; use max so we never reject block-winning shares.
+    if network_target_be > channel_target_be {
+        channel_target_be = network_target_be;
     }
     let channel_target_sv2 = target_be_to_sv2(&channel_target_be)?;
 
@@ -509,14 +501,8 @@ fn build_job_messages(
     job_id: u32,
     raw: &RawTemplate,
 ) -> Result<(SetNewPrevHash<'static>, NewExtendedMiningJob<'static>, JobInfo)> {
-    // Deserialize TDP payloads (bytes are cloned so parsed types can borrow from them).
-    let mut nt_bytes = raw.new_template.clone();
-    let mut snph_bytes = raw.set_new_prev_hash.clone();
-    let nt: NewTemplate<'_> = binary_sv2::from_bytes(&mut nt_bytes)
-        .map_err(|e| anyhow::anyhow!("parse NewTemplate: {e:?}"))?;
-    let snph: template_distribution_sv2::SetNewPrevHash<'_> =
-        binary_sv2::from_bytes(&mut snph_bytes)
-            .map_err(|e| anyhow::anyhow!("parse SetNewPrevHash: {e:?}"))?;
+    let nt = &raw.new_template;
+    let snph = &raw.set_new_prev_hash;
 
     // Extract everything we need before the temp vecs go out of scope.
     let coinbase_script_prefix = nt.coinbase_prefix.inner_as_ref().to_vec();

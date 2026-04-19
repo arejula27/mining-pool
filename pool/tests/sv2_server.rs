@@ -29,20 +29,12 @@ use tokio::net::TcpStream;
 use pool::{
     noise_connection::{connect_noise, NoiseReadHalf},
     stratum_sv2::{AuthorityKeypair, Sv2Server},
-    template_client,
+    node_ipc,
 };
 
 // Fixed port for SV2 server in tests.  Tests run with --test-threads=1 so no conflicts.
 const SV2_TEST_PORT: u16 = 13334;
 
-fn datadir() -> String {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .join(".bitcoin-data")
-        .to_string_lossy()
-        .into_owned()
-}
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -112,15 +104,12 @@ async fn sv2_server_open_extended_channel() {
     // Any parseable address works; assume_checked() skips network validation.
     let pool_addr = "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq".to_string();
 
-    let tp_authority_pubkey = template_client::read_authority_pubkey(&datadir())
-        .expect("read sv2_authority_key — run `just start-all` first");
-    let (template_rx, solution_tx) = template_client::start(
-        "127.0.0.1:18447".parse().unwrap(),
-        tp_authority_pubkey,
-        100,
-    )
-    .await
-    .expect("connect to sv2-tp");
+    let ipc_socket = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent().unwrap()
+        .join(".bitcoin-data/regtest/node.sock");
+    let (template_rx, solution_tx) = node_ipc::start(&ipc_socket, 100)
+        .await
+        .expect("connect to Bitcoin Core IPC — run `just start` first");
 
     let listen_addr: SocketAddr = format!("127.0.0.1:{SV2_TEST_PORT}").parse().unwrap();
     let server = Sv2Server::new(authority, listen_addr, template_rx, pool_addr, solution_tx, None);

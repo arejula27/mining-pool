@@ -14,10 +14,7 @@ Bitaxe/NerdAxe  (SV1)
        │  SV2 Mining Protocol + Noise
        ▼
   nuestra pool           ← única pieza que escribimos
-       │  SV2 Template Distribution Protocol
-       ▼
-  bitcoin-core-sv2       ← binario de sv2-apps, sin modificar
-       │
+       │  Cap'n Proto IPC (UNIX socket)
        ▼
   Bitcoin Core (regtest / mainnet)
 ```
@@ -56,19 +53,38 @@ El servidor SV1 que escribimos en `stratum.rs` lo reemplaza el translator de sv2
 - [x] Retirar `sv1_api` de `Cargo.toml`
 
 ## Paso 4b — Cliente de Template Distribution Protocol
-Reemplaza el RPC poller (`rpc::TemplatePoller`) con una conexión real al Template Provider.
-Crates ya en `Cargo.toml`: `template_distribution_sv2 = "5.0.0"`. Añadir: `stratum-apps = "0.3.0"` (feature `network_helpers`) para `NoiseTcpStream` / `accept_noise_connection`.
-- [x] New module `pool/src/template_client.rs`
-- [x] TCP client that connects to sv2-tp (configurable address, default port 18447 on regtest)
-- [x] Noise **initiator** handshake toward the template provider (reads authority pubkey from `sv2_authority_key` file in bitcoind datadir)
-- [x] Send `SetupConnection` + `CoinbaseOutputConstraints`; receive `NewTemplate` + `SetNewPrevHash`
-- [x] Broadcast via `tokio::sync::watch<RawTemplate>` channel; replaces `TemplatePoller`
-- [x] Remove `TemplatePoller` and dead SV1 code (`StratumJob`, `build_stratum_job`) from codebase
-- [x] Add `sv2-tp` binary to `flake.nix`; `just start-all` / `just stop-all` recipes
-- [x] Write `bitcoin/sv2-tp.conf`; integration test `tests/template_client.rs`
-- [x] Fix `build_sv2_coinbase_from_tdp` for segwit: add `use_segwit: bool` param (true when `coinbase_tx_outputs_count > 0`); insert marker/flag bytes in prefix; append 32-byte witness nonce before locktime in suffix
-- [x] Write `pool/tests/mine_block.rs`: receive `RawTemplate` → build segwit coinbase → mine nonce → send `SubmitSolution` to sv2-tp → sv2-tp reconstructs block and calls `submitblock` → assert height increased
-- [x] Expose `mpsc::Sender<SubmitSolutionData>` from `template_client::start`; background `io_loop` owns `NoiseWriteHalf` and sends `SubmitSolution` on demand
+~~Reemplaza el RPC poller con conexión TCP+Noise a sv2-tp.~~ Completado, pero sustituido por Paso 4b-IPC.
+- [x] (histórico) `template_client.rs`, sv2-tp en flake, `bitcoin/sv2-tp.conf`, tests `template_client.rs` y `mine_block.rs`
+
+## Paso 4b-IPC — IPC directo a Bitcoin Core (elimina sv2-tp)
+El equipo de sv2 confirmó que sv2-tp solo es necesario si pool y nodo corren en máquinas distintas.
+Conectamos directamente al nodo via Cap'n Proto sobre UNIX socket usando los mismos crates que usa sv2-tp internamente.
+
+**Módulo objetivo: `pool/src/node_ipc.rs` (~150 líneas)**
+
+**Crates a añadir:** `bitcoin-capnp-types = "0.1.0"`, `capnp`, `capnp-rpc`, `tokio-util` (feature `compat`)
+
+**Config:** sustituir `TP_ADDRESS` por `BITCOIN_IPC_SOCKET` (path al UNIX socket, e.g. `.bitcoin-data/regtest/node.sock`)
+
+**Interfaz pública idéntica a la actual:**
+`start(socket_path, coinbase_output_max_size)` → `(watch::Receiver<RawTemplate>, mpsc::Sender<SubmitSolutionData>)`
+
+**Internos** (todo en un único archivo):
+- Thread dedicado: `std::thread::spawn` + `Runtime::new()` + `LocalSet::block_on` (capnp-rpc es `!Send`)
+- Bootstrap Cap'n Proto: `UnixStream` → `RpcSystem` → `InitIpcClient` → `MiningIpcClient` → `BlockTemplateIpcClient`
+- Fetch template: `get_block_header` + `get_coinbase_tx` + `get_coinbase_merkle_path` → construir `NewTemplate` + `SetNewPrevHash`
+- `waitNext` loop (timeout 10 s): si cambia `prev_hash` → chain tip nuevo; si no → fee mempool → emitir al `watch` channel
+- Submit solution: `template_ipc_client.submit_solution_request()` con version/timestamp/nonce/coinbase
+
+**`RawTemplate` pasa de bytes crudos a tipos estructurados** (`NewTemplate<'static>` + `SetNewPrevHash<'static>`) — elimina la serialización/deserialización redundante.
+
+**Eliminar:**
+- [ ] `pool/src/template_client.rs` → reemplazar por `node_ipc.rs`
+- [ ] sv2-tp de `flake.nix`, `bitcoin/sv2-tp.conf`, recetas `just start/stop-sv2-tp`
+- [ ] `read_authority_pubkey` y lectura de `sv2_authority_key`
+- [ ] `TP_ADDRESS` de `config.rs`; añadir `BITCOIN_IPC_SOCKET`
+- [ ] Actualizar `stratum_sv2.rs` para consumir `NewTemplate`/`SetNewPrevHash` directamente (sin `binary_sv2::from_bytes`)
+- [ ] Actualizar tests `mine_block.rs` y `sv1_miner.rs` para el nuevo arranque (sin sv2-tp subprocess)
 
 ## Paso 4c — Servidor SV2 Mining Protocol
 La pool habla SV2 Extended Channel con el translator. Los Bitaxes se conectan al translator.
@@ -158,7 +174,7 @@ Using extended channels, miners (via translator) send `SubmitSharesExtended`.
 - [ ] Frontend/API pública con leaderboard
 
 ## Paso 9 — Integración end-to-end
-- [ ] Stack completo en local: bitcoind + bitcoin-core-sv2 + nuestra pool + translator
+- [ ] Stack completo en local: bitcoind + nuestra pool (IPC directo) + translator
 - [ ] Conectar Bitaxe real (o simulado) al translator
 - [ ] Verificar que recibe jobs y envía shares válidos a través del stack completo
 - [ ] Verificar que un bloque encontrado en regtest se propaga a Core

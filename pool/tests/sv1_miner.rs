@@ -5,7 +5,7 @@
 //!   pool ──SubmitSolution──▶ sv2-tp ──submitblock──▶ bitcoin-core
 //!   assert block height increased, mine 100 maturity blocks, spend coinbase
 //!
-//! Requires `just start-all` (bitcoin-node + sv2-tp) before running.
+//! Requires `just start` (bitcoin-node) before running.
 //! Pool and translator are spawned in-process / as subprocess by this test.
 //! Run with: `just int-sv1`
 
@@ -23,8 +23,8 @@ use bitcoin::{
 use pool::{
     db::DbEvent,
     rpc::{RpcClient, REGTEST_BURN_ADDR},
+    node_ipc,
     stratum_sv2::{AuthorityKeypair, Sv2Server},
-    template_client,
 };
 use secp256k1::{rand::thread_rng, Keypair, Secp256k1};
 use serde_json::{json, Value};
@@ -35,13 +35,11 @@ const POOL_PORT: u16 = 13335;
 // Downstream port where translator listens for SV1 miners.
 const SV1_PORT: u16 = 34255;
 
-fn datadir() -> String {
+fn ipc_socket() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .unwrap()
-        .join(".bitcoin-data")
-        .to_string_lossy()
-        .into_owned()
+        .join(".bitcoin-data/regtest/node.sock")
 }
 
 fn regtest_client() -> RpcClient {
@@ -155,15 +153,9 @@ async fn sv1_mine_block_through_translator() {
     let (pub_key, priv_key) = generate_keypair();
     let authority = AuthorityKeypair { public: pub_key, private: priv_key };
 
-    let tp_pubkey = template_client::read_authority_pubkey(&datadir())
-        .expect("read sv2_authority_key — run `just start-all` first");
-    let (template_rx, solution_tx) = template_client::start(
-        "127.0.0.1:18447".parse().unwrap(),
-        tp_pubkey,
-        100,
-    )
-    .await
-    .expect("connect to sv2-tp");
+    let (template_rx, solution_tx) = node_ipc::start(&ipc_socket(), 100)
+        .await
+        .expect("connect to Bitcoin Core IPC — run `just start` first");
 
     let pool_addr: SocketAddr = format!("127.0.0.1:{POOL_PORT}").parse().unwrap();
     let server = Sv2Server::new(authority, pool_addr, template_rx, miner_address.clone(), solution_tx, None);
@@ -421,15 +413,9 @@ async fn share_ack_does_not_block_on_db() {
 
     let (pub_key, priv_key) = generate_keypair();
     let authority = AuthorityKeypair { public: pub_key, private: priv_key };
-    let tp_pubkey = template_client::read_authority_pubkey(&datadir())
-        .expect("read sv2_authority_key — run `just start-all` first");
-    let (template_rx, solution_tx) = template_client::start(
-        "127.0.0.1:18447".parse().unwrap(),
-        tp_pubkey,
-        100,
-    )
-    .await
-    .expect("connect to sv2-tp");
+    let (template_rx, solution_tx) = node_ipc::start(&ipc_socket(), 100)
+        .await
+        .expect("connect to Bitcoin Core IPC — run `just start` first");
 
     let pool_addr: SocketAddr = format!("127.0.0.1:{ACK_POOL_PORT}").parse().unwrap();
     let server = Sv2Server::new(
