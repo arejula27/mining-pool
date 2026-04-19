@@ -30,8 +30,13 @@ start:
 
 # Stop bitcoin-node gracefully via RPC
 stop:
-    {{cli}} stop || true
-    @rm -f {{pid_file}}
+    #!/usr/bin/env bash
+    {{cli}} stop 2>/dev/null || true
+    if [ -f {{pid_file}} ]; then
+        PID=$(cat {{pid_file}})
+        while kill -0 "$PID" 2>/dev/null; do sleep 0.5; done
+        rm -f {{pid_file}}
+    fi
 
 # Force-kill bitcoin-node (when RPC is unavailable)
 kill:
