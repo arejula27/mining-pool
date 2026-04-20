@@ -17,11 +17,10 @@ Do not use `cargo` directly. Use the `just` recipes below instead.
 | `just check` | `cargo check` including test targets |
 | `just unit` | Run unit tests from `src/` only (`--lib`, no node required) |
 | `just clean` | Remove build artifacts |
-| `just int` | Start full environment, run all integration tests (`tests/`), stop |
+| `just int` | Start node, run all integration test suites sequentially, stop |
 | `just int-rpc` | Start bitcoin-node only, run `tests/rpc.rs`, stop |
-| `just int-tdp` | Start full environment, run `tests/template_client.rs`, stop |
-| `just int-mine` | Start full environment, run `tests/mine_block.rs`, stop |
-| `just int-sv1` | Start full environment, run `tests/sv1_miner.rs`, stop |
+| `just int-mine` | Start node, mine 1 block, run `tests/mine_block.rs`, stop |
+| `just int-sv1` | Reset chain, start node, run `tests/sv1_miner.rs`, stop |
 
 ### Pool
 
@@ -40,13 +39,7 @@ Do not use `cargo` directly. Use the `just` recipes below instead.
 | `just mine [n]` | Mine `n` blocks to a throwaway address |
 | `just node-check` | Verify bitcoin-node RPC is responding |
 | `just cli <args>` | Run `bitcoin-cli` against the local regtest node |
-
-### sv2-tp (Template Provider)
-
-| Command | What it does |
-|---|---|
-| `just start-sv2-tp` | Start sv2-tp in the background (requires bitcoin-node) |
-| `just stop-sv2-tp` | Stop sv2-tp |
+| `just reset-chain` | Wipe regtest data (run `stop` first) |
 
 ### Translator (SV1 → SV2)
 
@@ -55,28 +48,19 @@ Do not use `cargo` directly. Use the `just` recipes below instead.
 | `just start-translator` | Start translator_sv2 (requires pool running on :3333) |
 | `just stop-translator` | Stop the translator |
 
-### Combined
-
-| Command | What it does |
-|---|---|
-| `just start-all` | Start bitcoin-node + sv2-tp |
-| `just stop-all` | Stop sv2-tp + bitcoin-node |
-| `just kill-all` | Force-kill translator, sv2-tp, and bitcoin-node |
-
 To run a single integration test manually:
 ```
-just start-all
+just start
+just mine 1
 cargo test --manifest-path pool/Cargo.toml --test <suite> <test_name> -- --nocapture
-just stop-all
+just stop
 ```
 
-### What just manages vs what tests spawn
+### What `just` manages vs what tests spawn
 
-`just start-all` starts the persistent shared infrastructure (bitcoin-node, sv2-tp).
-Integration tests that need the pool server (`sv2_server.rs`, `sv1_miner.rs`) spawn it
-in-process via `tokio::spawn`. `sv1_miner.rs` also spawns `translator_sv2` as a subprocess
-because it generates an ephemeral keypair per run and must configure the translator with
-that same key; using `just start-translator` (which reads `.env`) would break test isolation.
+`just start` starts the bitcoin-node. Integration tests that need the pool server (`sv2_server.rs`, `sv1_miner.rs`) spawn it in-process via `tokio::spawn`. `sv1_miner.rs` also spawns `translator_sv2` as a subprocess because it generates an ephemeral keypair per run and must configure the translator with that key; using `just start-translator` would break test isolation.
+
+**Important:** Bitcoin Core v30.2 shuts down when any IPC client disconnects (upstream bug, not yet fixed). `just int` therefore restarts the node before each test suite that uses IPC.
 
 ## Target architecture
 
@@ -88,10 +72,7 @@ Bitaxe/NerdAxe (SV1)
        │  SV2 Mining Protocol + Noise
        ▼
   our pool               ← what we write
-       │  SV2 Template Distribution Protocol
-       ▼
-  bitcoin-core-sv2       ← sv2-apps binary, unmodified
-       │
+       │  Cap'n Proto IPC (UNIX socket)
        ▼
   Bitcoin Core (regtest / mainnet)
 ```
@@ -104,13 +85,13 @@ Single Rust crate (`pool/`) with both a library target (`src/lib.rs`) and a bina
 
 Bitcoin node config is in `bitcoin/bitcoin.conf` (tracked in git, regtest). Blockchain data goes to `.bitcoin-data/` (gitignored). `just start` copies the config into the data dir before launching bitcoind so the node never reads `~/.bitcoin`.
 
-### Modules (current)
+### Modules
 
-- **`config`** — reads `STRATUM_PORT`, `POOL_ADDRESS`, `POOL_AUTHORITY_PUBLIC_KEY`, `POOL_AUTHORITY_PRIVATE_KEY`, `TP_ADDRESS` from environment variables (sourced from `.env` via `just run`).
+- **`config`** — reads env vars: `SV2_LISTEN_ADDR` (default `0.0.0.0:3333`), `POOL_ADDRESS`, `POOL_AUTHORITY_PUBLIC_KEY`, `POOL_AUTHORITY_PRIVATE_KEY`, `BITCOIN_IPC_SOCKET` (default `.bitcoin-data/regtest/node.sock`), `RPC_URL`, `RPC_USER`, `RPC_PASS`.
 
-- **`jobs`** — Protocol-agnostic coinbase and merkle construction. `build_sv2_coinbase_from_tdp` builds the segwit coinbase from TDP data; `build_merkle_branch` computes sibling hashes. `pool/tests/fixtures/block_250000.json` is a real-block fixture for unit tests.
+- **`jobs`** — Protocol-agnostic coinbase and merkle construction. Each miner gets their own coinbase output pointing to their address (lottery model — if they find a block, they keep 100%). `build_sv2_coinbase_from_tdp` builds the segwit coinbase; `build_merkle_branch` computes sibling hashes. `pool/tests/fixtures/block_250000.json` is a real-block fixture for unit tests.
 
-- **`template_client`** — SV2 Template Distribution Protocol client. Connects to sv2-tp (default `127.0.0.1:18447`), completes the Noise initiator handshake, sends `SetupConnection` + `CoinbaseOutputConstraints`, and receives `NewTemplate` + `SetNewPrevHash`. Broadcasts templates over a `tokio::sync::watch` channel and accepts `SubmitSolution` via an `mpsc::Sender`.
+- **`node_ipc`** — Connects directly to Bitcoin Core via Cap'n Proto over a UNIX socket (bypasses sv2-tp entirely). Bootstraps `InitIpcClient` → `MiningIpcClient` → `BlockTemplateIpcClient`, runs a `waitNext` polling loop, and broadcasts templates over a `tokio::sync::watch` channel. Accepts `SubmitSolution` via an `mpsc::Sender`. Runs in a dedicated `std::thread` + single-threaded `tokio` runtime because `capnp-rpc` is `!Send`.
 
 - **`stratum_sv2`** — SV2 Mining Protocol server. TCP listener with Noise NX responder handshake per connection. Handles `SetupConnection`, `OpenExtendedMiningChannel`, and `SubmitShares`. Sends `NewExtendedMiningJob` and `SetNewPrevHash` to connected channels when a new template arrives. Accepts `Option<std::sync::mpsc::Sender<DbEvent>>` to emit share and miner-connected events to the DB worker without blocking the ACK path.
 

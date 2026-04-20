@@ -139,11 +139,104 @@ Using extended channels, miners (via translator) send `SubmitSharesExtended`.
 - [x] `hashrate = Σ(share_difficulty) * 2^32 / window_seconds` (misma fórmula que blitzpool)
 - [x] API interna (`DbReader`): `hashrate_for_address(address, lookback_minutes)`, `pool_hashrate(lookback_minutes)` — WAL mode, read-only connection
 
-## Paso 8 — Competición por época (Bitaxe League)
+## Paso 8 — Grupos colaborativos
+
+Dos o más miners pueden asociarse para compartir la coinbase: si cualquiera del grupo
+encuentra un bloque, el subsidio se reparte exactamente según los pesos acordados.
+El modelo sigue siendo lottery (cada bloque encontrado va a la coinbase del grupo, no hay
+redistribución externa), pero la coinbase ya tiene múltiples outputs desde el principio.
+
+**Decisión de diseño:** los miners en solitario son grupos de uno (weight = 1, un solo miembro).
+Así el código de `stratum_sv2` y de construcción de coinbase no tiene bifurcaciones —
+siempre opera con `Vec<(address, weight)>`. El coste es un INSERT de grupo en la primera
+conexión del miner, lo cual es insignificante.
+
+### Modelo de datos
+- [ ] Nueva tabla `groups` (`group_id UUID PK`, `name TEXT`, `auto_split BOOLEAN`)
+- [ ] Nueva tabla `group_members` (`group_id`, `miner_address`, `weight INTEGER`, `joined_at`)
+  — `weight` es un entero; la distribución se calcula como `weight / Σweights`
+- [ ] Al conectar un miner por primera vez sin grupo declarado: crear automáticamente
+  un grupo solo (`auto_split = false`, `weight = 1`) con su dirección
+
+### Coinbase multi-output
+- [ ] Extender `build_sv2_coinbase_from_tdp` para aceptar `Vec<(address, weight)>`
+  en lugar de una sola dirección
+- [ ] Los outputs se ordenan por weight desc para reproducibilidad (misma serialización
+  independientemente del orden de inserción en BD)
+- [ ] El `coinbase_output_max_size` enviado en `CoinbaseOutputConstraints` debe
+  actualizarse para reflejar el peor caso (N outputs × ~34 bytes cada uno)
+
+### Integración en stratum_sv2
+- [ ] Al recibir `OpenExtendedMiningChannel`, consultar BD para obtener el grupo del miner
+  y construir la coinbase con todos sus miembros y pesos
+- [ ] Todos los miembros activos del mismo grupo reciben exactamente el mismo job
+  (mismo `job_id`, mismo coinbase) — comparten trabajo, no lo duplican
+- [ ] Al cambiar template, reemitir el job del grupo con el nuevo template base
+  (los pesos no cambian entre templates)
+
+### Modo auto-split
+- [ ] Si `groups.auto_split = true`, recalcular los pesos de cada miembro antes de
+  emitir cada nuevo job, usando `DbReader::hashrate_for_address(address, 60)`
+- [ ] Los pesos se redondean a enteros proporcionales (ej. hashrates [3 TH, 1 TH] → pesos [3, 1])
+- [ ] Si un miembro lleva más de N minutos sin shares (sin hashrate medible), su peso
+  cae a 0 temporalmente hasta que vuelva a minar
+
+### Gestión de grupos (API HTTP)
+- [ ] `POST /groups` — crear grupo (`name`, `auto_split`)
+- [ ] `POST /groups/:id/members` — añadir miembro (`miner_address`, `weight`)
+- [ ] `DELETE /groups/:id/members/:address` — salir del grupo
+- [ ] `GET /groups/:id` — ver grupo, miembros y pesos actuales
+
+### Tests
+- [ ] Unit: `build_sv2_coinbase_from_tdp` con múltiples outputs — verificar que la suma
+  de outputs = coinbase_value y que los scripts son correctos
+- [ ] Unit: miner que conecta sin grupo → se crea grupo solo automáticamente
+- [ ] Integration: dos miners del mismo grupo reciben el mismo `job_id`; un miner
+  en solitario recibe job diferente en la misma ronda
+- [ ] Integration: auto-split recalcula pesos correctamente al llegar nuevo template
+
+## Paso 9 — Plantillas custom (Fase 2)
+
+Miners avanzados con nodo Bitcoin propio pueden declarar su propia template vía
+Job Declaration Protocol (JDC). La pool actúa como árbitro de shares: valida que
+el trabajo enviado es válido pero no construye la coinbase.
+
+### Arquitectura
+```
+[Bitcoin Node del miner] → [JDC client] → [Job Declarator Server (JDS)] → nuestra pool
+[Miner SV2]  ─────────────────────────────────────────────────────────→  (shares)
+```
+El JDS es el binario oficial de sv2-apps, sin modificar. La pool recibe shares
+referenciados a jobs declarados externamente.
+
+### Verificación de coinbase para grupos
+Cuando un miner pertenece a un grupo y usa template propia, la pool **debe verificar**
+que los outputs de la coinbase declarada respetan la distribución acordada:
+- Extraer outputs del coinbase del job declarado
+- Comprobar que cada `(address, amount)` coincide con los pesos del grupo aplicados
+  al `coinbase_value` del template (tolerancia ±1 sat por redondeo)
+- Si no coincide → rechazar el job con `DeclareMiningJobError`
+- Sin esta verificación, un miembro podría declarar una coinbase que se lleva el 100%
+
+### Tablas adicionales
+- `declared_jobs` (`job_id`, `miner_address`, `template_hash`, `coinbase_tx_hex`,
+  `declared_at`) — para auditoría y resolución de disputas
+
+### Lo que queda fuera de este paso
+- [ ] Integración completa con bark para pago al ganador de grupos en competición
+- [ ] UI para gestión de grupos
+
+## Paso 10 — Competición por época (Bitaxe League)
+
+> Aplazado respecto al plan original para dar prioridad a grupos colaborativos (Paso 8).
+> Los grupos pueden participar en la competición: el grupo como unidad tiene su
+> `best_difficulty` y su `active_minutes` agregados.
 
 ### Modelo de negocio
-- Mineros **free**: minan normal, coinbase a su dirección, sin acceso a competición
+- Mineros **free**: minan normal, coinbase a su dirección (o grupo), sin acceso a competición
 - Mineros **competitor**: pagan 5 000 sats de entrada → compiten en la **siguiente** época
+- Un grupo completo puede inscribirse: todos los miembros pagan la cuota, el premio
+  se reparte según los pesos del grupo
 - Premio: suma de todas las entradas menos comisión arbitraria de la pool
 - Pago: ARK (almacenar dirección ARK del ganador; lógica de pago posterior)
 
@@ -173,11 +266,13 @@ Using extended channels, miners (via translator) send `SubmitSharesExtended`.
 - [ ] Pago automático al ganador via ARK
 - [ ] Frontend/API pública con leaderboard
 
-## Paso 9 — Integración end-to-end
+## Paso 11 — Integración end-to-end
 - [ ] Stack completo en local: bitcoind + nuestra pool (IPC directo) + translator
 - [ ] Conectar Bitaxe real (o simulado) al translator
 - [ ] Verificar que recibe jobs y envía shares válidos a través del stack completo
 - [ ] Verificar que un bloque encontrado en regtest se propaga a Core
+- [ ] Simular dos miners en grupo colaborativo: verificar que la coinbase del bloque
+  encontrado tiene los dos outputs correctos
 - [ ] Simular una época completa con varios miners (free + competitor) y verificar ganador
 
 ---
